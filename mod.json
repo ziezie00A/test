@@ -1,0 +1,34 @@
+{
+    "geode": "5.7.1",
+    "gd": {
+        "win": "2.2081",
+        "android": "2.2081",
+        "mac": "2.2081",
+        "ios": "2.2081"
+    },
+    "id": "brky1972.macrosafeguard",
+    "name": "Macro Safeguard",
+    "version": "v1.0.2",
+    "developer": "brky1972",
+    "description": "Macro Safeguard: Automatically records attempts when beating personal bests.",
+    "dependencies": {
+        "geode.node-ids": ">=v1.23.3"
+    },
+    "settings": {
+        "only-new-best": {
+            "type": "bool",
+            "name": "Save on New Best Only",
+            "description": "When enabled, records only when beating your high score. Turn off to use custom percentage.",
+            "default": true
+        },
+        "custom-percentage": {
+            "type": "int",
+            "name": "Custom Percentage Threshold",
+            "description": "Minimum percentage required to save the recording (only if 'Save on New Best' is off).",
+            "default": 10,
+            "min": 1,
+            "max": 100,
+            "enable-if": "!only-new-best"
+        }
+    }
+}	
