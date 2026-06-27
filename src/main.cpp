@@ -1,16 +1,8 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
-#include <Geode/modify/CCEGLView.hpp>      // Hook swapBuffers for frame capture
+#include <Geode/modify/CCEGLView.hpp>
 #include <Geode/ui/Notification.hpp>
-
-// Android NDK Media APIs — require API 21+ (fine for GD)
-#include <media/NdkMediaCodec.h>
-#include <media/NdkMediaMuxer.h>
-#include <media/NdkMediaFormat.h>
-
-// OpenGL ES — glReadPixels
-#include <GLES2/gl2.h>
 
 #include <vector>
 #include <string>
@@ -22,16 +14,26 @@
 #include <mutex>
 #include <queue>
 #include <condition_variable>
+
+#ifdef GEODE_IS_ANDROID
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaMuxer.h>
+#include <media/NdkMediaFormat.h>
+#include <GLES2/gl2.h>
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 using namespace geode::prelude;
 
 // ═══════════════════════════════════════════════════════════════════
-//  RGBA → I420 (YUV420Planar)
-//  Most Android H.264 encoders only accept YUV420Planar (I420), not RGBA.
-//  OpenGL glReadPixels returns bottom-up rows, so we flip vertically here.
+//  All video recording logic is Android-only
 // ═══════════════════════════════════════════════════════════════════
+#ifdef GEODE_IS_ANDROID
+
+// ─── RGBA → I420 (YUV420Planar) ──────────────────────────────────────────────
+// Most Android H.264 encoders only accept YUV, not RGBA.
+// OpenGL returns bottom-up rows, so we flip vertically here.
 static void rgbaToI420(
     const uint8_t* rgba, int width, int height,
     uint8_t* dst)   // layout: [Y plane][U plane][V plane]
@@ -52,7 +54,7 @@ static void rgbaToI420(
             uint8_t r = src[col * 4 + 0];
             uint8_t g = src[col * 4 + 1];
             uint8_t b = src[col * 4 + 2];
-            yDst[col] = static_cast<uint8_t>(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+            yDst[col] = static_cast<uint8_t>(((66*r + 129*g + 25*b + 128) >> 8) + 16);
         }
     }
 
@@ -62,8 +64,8 @@ static void rgbaToI420(
     for (int row = 0; row < uvHeight; ++row) {
         int srcRow = (height - 1) - (row * 2);
         const uint8_t* src  = rgba   + srcRow * width * 4;
-        uint8_t*       uDst = uPlane + row    * uvWidth;
-        uint8_t*       vDst = vPlane + row    * uvWidth;
+        uint8_t*       uDst = uPlane + row * uvWidth;
+        uint8_t*       vDst = vPlane + row * uvWidth;
         for (int col = 0; col < uvWidth; ++col) {
             uint8_t r = src[col * 2 * 4 + 0];
             uint8_t g = src[col * 2 * 4 + 1];
@@ -75,9 +77,8 @@ static void rgbaToI420(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  VideoRecorder
-//  Uses AMediaCodec (H.264 encoder) + AMediaMuxer (MP4 container).
-//  Frame capture runs on the GL thread; encoding runs on a background thread.
+//  VideoRecorder — AMediaCodec (H.264) + AMediaMuxer (MP4)
+//  Frame capture on GL thread, encoding on background thread.
 // ═══════════════════════════════════════════════════════════════════
 class VideoRecorder {
 public:
@@ -86,7 +87,6 @@ public:
 
     bool isRecording() const { return m_isRecording.load(); }
 
-    // ─── Start a new recording ────────────────────────────────────────────
     bool start(const std::string& path, int width, int height) {
         if (m_isRecording.load()) return false;
 
@@ -111,7 +111,7 @@ public:
         AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_FRAME_RATE,       TARGET_FPS);
         AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_BIT_RATE,         BIT_RATE);
         AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_I_FRAME_INTERVAL, 1);
-        // 0x13 = OMX_COLOR_FormatYUV420Planar — the safest choice on Android
+        // 0x13 = OMX_COLOR_FormatYUV420Planar — safest choice on Android
         AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_COLOR_FORMAT,     0x13);
 
         media_status_t st = AMediaCodec_configure(
@@ -127,7 +127,6 @@ public:
         }
 
         // ── Create MP4 muxer ─────────────────────────────────────────────
-        // AMediaMuxer needs a real file descriptor
         int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) {
             log::error("[MacroSafeguard] Cannot open output file: {}", path);
@@ -156,9 +155,8 @@ public:
         return true;
     }
 
-    // ─── Capture current framebuffer — call from the GL thread ───────────
-    // (Called in CCEGLView::swapBuffers before the swap, so back buffer
-    //  still contains this frame's fully-rendered pixels.)
+    // Called from the GL thread inside CCEGLView::swapBuffers BEFORE the swap.
+    // The back buffer still holds the fully rendered current frame at this point.
     void captureFrame() {
         if (!m_isRecording.load()) return;
 
@@ -180,18 +178,17 @@ public:
         ++m_capturedFrames;
     }
 
-    // ─── Finalize and close the recording ────────────────────────────────
     // saveFile=false → delete the file (attempt didn't qualify)
     void stop(bool saveFile) {
         if (!m_isRecording.load()) return;
         m_isRecording.store(false);
 
-        // Signal the encode thread to drain and exit
+        // Signal encoder thread to drain and exit
         m_stopEncoder.store(true);
         m_queueCv.notify_all();
         if (m_encodeThread.joinable()) m_encodeThread.join();
 
-        // Send EOS to the codec and drain any remaining output
+        // Send EOS and drain any remaining codec output
         if (m_codec) {
             ssize_t idx = AMediaCodec_dequeueInputBuffer(m_codec, 100'000);
             if (idx >= 0) {
@@ -216,7 +213,6 @@ public:
         } else {
             log::info("[MacroSafeguard] Saved → {}", m_path);
         }
-
         m_capturedFrames = 0;
     }
 
@@ -226,16 +222,16 @@ private:
         std::vector<uint8_t> rgba;
     };
 
-    AMediaCodec* m_codec       = nullptr;
-    AMediaMuxer* m_muxer       = nullptr;
-    int          m_videoTrack  = -1;
-    int          m_fd          = -1;
+    AMediaCodec* m_codec        = nullptr;
+    AMediaMuxer* m_muxer        = nullptr;
+    int          m_videoTrack   = -1;
+    int          m_fd           = -1;
     bool         m_muxerStarted = false;
 
-    int          m_width = 0, m_height = 0;
-    std::string  m_path;
-    int64_t      m_presentationUs = 0;
-    int64_t      m_capturedFrames = 0;
+    int         m_width = 0, m_height = 0;
+    std::string m_path;
+    int64_t     m_presentationUs = 0;
+    int64_t     m_capturedFrames = 0;
 
     std::chrono::steady_clock::time_point m_recordStart;
 
@@ -246,10 +242,8 @@ private:
     std::condition_variable  m_queueCv;
     std::queue<Frame>        m_queue;
 
-    // ─── Background encode loop ───────────────────────────────────────────
-    // Drains the frame queue, feeds frames to the codec, and writes
-    // encoded data to the muxer. Exits once stop() sets m_stopEncoder
-    // AND the queue is fully empty.
+    // Drains the frame queue and feeds frames to the codec.
+    // Exits once stop() is set AND the queue is fully empty.
     void encodeLoop() {
         while (true) {
             Frame frame;
@@ -258,16 +252,15 @@ private:
                 m_queueCv.wait(lk, [this] {
                     return !m_queue.empty() || m_stopEncoder.load();
                 });
-                if (m_queue.empty()) break; // stopped and nothing left
+                if (m_queue.empty()) break;
                 frame = std::move(m_queue.front());
                 m_queue.pop();
-            }                               // lock released before encoding
+            } // lock released before encoding
             feedFrame(frame);
             drainCodec(/*eos=*/false);
         }
     }
 
-    // ─── Convert one RGBA frame to I420 and feed to the encoder ──────────
     void feedFrame(const Frame& frame) {
         if (!m_codec) return;
 
@@ -283,7 +276,6 @@ private:
             m_codec, static_cast<size_t>(idx), &bufCap);
 
         if (!buf || static_cast<int>(bufCap) < i420Size) {
-            // Buffer too small — skip, release slot
             AMediaCodec_queueInputBuffer(
                 m_codec, static_cast<size_t>(idx), 0, 0, frame.timestampUs, 0);
             return;
@@ -298,7 +290,6 @@ private:
             frame.timestampUs, 0);
     }
 
-    // ─── Pull encoded output and write to the MP4 muxer ──────────────────
     void drainCodec(bool eos) {
         if (!m_codec) return;
 
@@ -308,8 +299,8 @@ private:
                 m_codec, &info, eos ? 500'000 : 0);
 
             if (outIdx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
-                // First encoded output: grab the format, register the video track,
-                // and start the muxer. This must happen exactly once.
+                // First encoded output: register the video track and start muxer.
+                // This must happen exactly once.
                 if (!m_muxerStarted && m_muxer) {
                     AMediaFormat* outFmt = AMediaCodec_getOutputFormat(m_codec);
                     m_videoTrack = static_cast<int>(
@@ -322,10 +313,10 @@ private:
             }
 
             if (outIdx == AMEDIACODEC_INFO_TRY_AGAIN_LATER) break;
-            if (outIdx < 0) break;  // unexpected error
+            if (outIdx < 0) break;
 
-            // CODEC_CONFIG buffers carry SPS/PPS — already baked into the track
-            // format, so we must NOT write them again as sample data.
+            // CODEC_CONFIG buffers carry SPS/PPS — already embedded in the
+            // track format, so must NOT be written as sample data.
             if (!(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG)
                 && m_muxerStarted && m_videoTrack >= 0 && info.size > 0)
             {
@@ -347,14 +338,17 @@ private:
     }
 };
 
-// ═══════════════════════════════════════════════════════════════════
-//  Globals
-// ═══════════════════════════════════════════════════════════════════
-static VideoRecorder    g_recorder;
-static bool             g_isPlayLayerActive = false;
-static uint64_t         g_currentFrame      = 0;
+// ─── Globals (Android only) ───────────────────────────────────────────────────
+static VideoRecorder g_recorder;
 
-// Input log — kept for potential future replay use
+#endif // GEODE_IS_ANDROID
+
+// ═══════════════════════════════════════════════════════════════════
+//  Globals shared across all platforms
+// ═══════════════════════════════════════════════════════════════════
+static bool     g_isPlayLayerActive = false;
+static uint64_t g_currentFrame      = 0;
+
 struct ActionEvent {
     uint64_t frame;
     int      button;
@@ -364,11 +358,11 @@ struct ActionEvent {
 static std::vector<ActionEvent> g_recordedActions;
 
 // ═══════════════════════════════════════════════════════════════════
-//  CCEGLView hook
-//  We capture BEFORE swapBuffers so the back buffer still holds the
-//  fully-rendered current frame. After the swap the back-buffer
-//  content is undefined by the EGL spec.
+//  CCEGLView hook — Android only
+//  Capture BEFORE swapBuffers: back buffer still has the current frame.
+//  After the swap, back-buffer content is undefined by the EGL spec.
 // ═══════════════════════════════════════════════════════════════════
+#ifdef GEODE_IS_ANDROID
 class $modify(MyCCEGLView, CCEGLView) {
     void swapBuffers() {
         if (g_isPlayLayerActive) {
@@ -377,16 +371,17 @@ class $modify(MyCCEGLView, CCEGLView) {
         CCEGLView::swapBuffers();
     }
 };
+#endif
 
 // ═══════════════════════════════════════════════════════════════════
-//  PlayLayer hook
+//  PlayLayer hook — all platforms
 // ═══════════════════════════════════════════════════════════════════
 class $modify(MyPlayLayer, PlayLayer) {
     struct Fields {
         int  m_previousBest          = 0;
         int  m_maxPercentThisAttempt = 0;
         bool m_hasSavedThisAttempt   = false;
-        bool m_hasQuit               = false; // prevents startNewRecording after onQuit
+        bool m_hasQuit               = false;
     };
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
@@ -405,11 +400,10 @@ class $modify(MyPlayLayer, PlayLayer) {
         return true;
     }
 
-    // ─── Open a fresh MP4 file for the upcoming attempt ───────────────────
     void startNewRecording() {
         if (m_fields->m_hasQuit) return;
 
-        // Safety: stop any lingering recorder before opening a new file
+#ifdef GEODE_IS_ANDROID
         if (g_recorder.isRecording()) g_recorder.stop(false);
 
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -421,18 +415,17 @@ class $modify(MyPlayLayer, PlayLayer) {
 
         auto* view   = CCDirector::sharedDirector()->getOpenGLView();
         auto  size   = view->getFrameSize();
-        // H.264 requires even dimensions
-        int   width  = static_cast<int>(size.width)  & ~1;
+        int   width  = static_cast<int>(size.width)  & ~1; // H.264 needs even dims
         int   height = static_cast<int>(size.height) & ~1;
 
         if (!g_recorder.start(filePath.string(), width, height)) {
             log::error("[MacroSafeguard] Failed to start VideoRecorder");
         }
+#endif
     }
 
-    // ─── Decide whether to keep or discard the finished recording ─────────
     void checkAndSaveIfQualified() {
-        if (m_fields->m_hasSavedThisAttempt) return; // already handled
+        if (m_fields->m_hasSavedThisAttempt) return;
 
         bool    onlyNewBest = Mod::get()->getSettingValue<bool>("only-new-best");
         int64_t threshold   = Mod::get()->getSettingValue<int64_t>("custom-percentage");
@@ -440,17 +433,17 @@ class $modify(MyPlayLayer, PlayLayer) {
         bool shouldSave = false;
 
         if (onlyNewBest) {
-            // Compare against the snapshot taken at the start of this attempt
             shouldSave = (m_fields->m_maxPercentThisAttempt > m_fields->m_previousBest);
         } else {
             shouldSave = (m_fields->m_maxPercentThisAttempt >= static_cast<int>(threshold));
         }
-        // Always save a full level clear regardless of settings
         if (m_fields->m_maxPercentThisAttempt >= 100) shouldSave = true;
 
-        // Lock immediately so no other path triggers a second save
         m_fields->m_hasSavedThisAttempt = true;
+
+#ifdef GEODE_IS_ANDROID
         g_recorder.stop(shouldSave);
+#endif
 
         if (shouldSave) {
             Notification::create(
@@ -461,12 +454,10 @@ class $modify(MyPlayLayer, PlayLayer) {
         }
     }
 
-    // ─── resetLevel: save/discard current attempt, then begin the next ────
     void resetLevel() {
         checkAndSaveIfQualified();
 
-        // FIX: snapshot BEFORE calling super, while m_normalPercent is still
-        // the authoritative post-death value (GD updates it before resetLevel)
+        // Snapshot BEFORE calling super while m_normalPercent is still accurate
         int newBest = this->m_level ? this->m_level->m_normalPercent : 0;
 
         PlayLayer::resetLevel();
@@ -480,14 +471,12 @@ class $modify(MyPlayLayer, PlayLayer) {
         startNewRecording();
     }
 
-    // ─── levelComplete: force 100%, save immediately, then let GD handle ──
     void levelComplete() {
         m_fields->m_maxPercentThisAttempt = 100;
-        checkAndSaveIfQualified();          // finalize before GD shows end screen
+        checkAndSaveIfQualified();
         PlayLayer::levelComplete();
     }
 
-    // ─── update: tick frame counter and track max percent ─────────────────
     void update(float dt) {
         PlayLayer::update(dt);
         if (g_isPlayLayerActive) {
@@ -499,9 +488,8 @@ class $modify(MyPlayLayer, PlayLayer) {
         }
     }
 
-    // ─── onQuit: catch force-quits during an attempt ──────────────────────
     void onQuit() {
-        m_fields->m_hasQuit = true;  // block startNewRecording if resetLevel fires
+        m_fields->m_hasQuit = true;
         checkAndSaveIfQualified();
         g_isPlayLayerActive = false;
         g_recordedActions.clear();
@@ -510,7 +498,7 @@ class $modify(MyPlayLayer, PlayLayer) {
 };
 
 // ═══════════════════════════════════════════════════════════════════
-//  PlayerObject hook — input log
+//  PlayerObject hook — all platforms
 // ═══════════════════════════════════════════════════════════════════
 class $modify(MyPlayerObject, PlayerObject) {
     void pushButton(PlayerButton button) {
