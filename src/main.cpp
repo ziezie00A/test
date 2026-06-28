@@ -18,6 +18,10 @@
 #include <cstring>
 #include <sys/stat.h>
 
+#ifdef _WIN32
+#include <direct.h>
+#endif
+
 #ifdef GEODE_IS_ANDROID
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaMuxer.h>
@@ -38,22 +42,44 @@
 
 using namespace geode::prelude;
 
-// ════════════════════════════════════════════════════════════════[...]
-//  Recordings directory
-// ════════════════════════════════════════════════════════════════[...]
+// ════════════════════════════════════════════════════════════════[[...]
+//  Recordings directory (platform-specific)
+// ════════════════════════════════════════════════════════════════[[...]
 static std::string getRecordingsDir() {
-    std::string dir = "/storage/emulated/0/MacroSafeguard/";
+    std::string dir;
+    
+#ifdef GEODE_IS_ANDROID
+    dir = "/storage/emulated/0/MacroSafeguard/";
+#elif defined(_WIN32)
+    // Windows: Use AppData\Local or Documents folder
+    char* appdata = getenv("APPDATA");
+    if (appdata) {
+        dir = std::string(appdata) + "\\MacroSafeguard\\";
+    } else {
+        // Fallback to Documents folder
+        dir = std::string(getenv("USERPROFILE")) + "\\Documents\\MacroSafeguard\\";
+    }
+#else
+    // Unix/Linux: Use ~/.local/share
+    char* home = getenv("HOME");
+    if (home) {
+        dir = std::string(home) + "/.local/share/MacroSafeguard/";
+    } else {
+        dir = "/tmp/MacroSafeguard/";
+    }
+#endif
+    
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     if (ec) {
-        mkdir(dir.c_str(), 0755);
+        log::warn("[MacroSafeguard] Failed to create directory: {}", dir);
     }
     return dir;
 }
 
-// ════════════════════════════════════════════════════════════════[...]
+// ════════════════════════════════════════════════════════════════[[...]
 //  All video + audio recording is Android-only
-// ════════════════════════════════════════════════════════════════[...]
+// ════════════════════════════════════════════════════════════════[[...]
 #ifdef GEODE_IS_ANDROID
 
 // ─── RGBA → I420 (YUV420Planar) ──────────────────────────────────
@@ -91,9 +117,9 @@ static void rgbaToI420(
     }
 }
 
-// ════════════════════════════════════════════════════════════════[...]
+// ════════════════════════════════════════════════════════════════[[...]
 //  VideoRecorder — H.264 video encoded to MP4
-// ════════════════════════════════════════════════════════════════[...]
+// ════════════════════════════════════════════════════════════════[[...]
 class VideoRecorder {
 public:
     static constexpr int TARGET_FPS = 30;
