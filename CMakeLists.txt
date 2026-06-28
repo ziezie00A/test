@@ -17,8 +17,9 @@ add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
 if (ANDROID)
     target_link_libraries(${PROJECT_NAME}
         geode-sdk
-        mediandk       # AMediaCodec, AMediaMuxer, AMediaFormat
-        GLESv2         # glReadPixels
+        mediandk       # AMediaCodec, AMediaMuxer — video encoding
+        aaudio         # AAudio — microphone capture
+        GLESv2         # glReadPixels — frame capture
         android
         log
     )
