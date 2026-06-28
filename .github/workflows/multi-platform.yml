@@ -32,6 +32,8 @@ jobs:
 
     name: ${{ matrix.config.name }}
     runs-on: ${{ matrix.config.os }}
+    env:
+      ANDROID_PLATFORM: android-26
 
     steps:
       - uses: actions/checkout@v4
