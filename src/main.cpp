@@ -22,52 +22,44 @@
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaMuxer.h>
 #include <media/NdkMediaFormat.h>
-#include <aaudio/AAudio.h>
 #include <GLES2/gl2.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+// Only include AAudio if we're targeting Android 26+
+#if __ANDROID_API__ >= 26
+#include <aaudio/AAudio.h>
+#define AAUDIO_AVAILABLE 1
+#else
+#define AAUDIO_AVAILABLE 0
+#endif
+
 #endif
 
 using namespace geode::prelude;
 
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  Recordings directory
-//
-//  CCFileUtils::getWritablePath() on Android returns the external
-//  app storage path, e.g.:
-//    /storage/emulated/0/Android/data/com.robtopx.geometryjump/files/
-//
-//  This IS visible in any file manager under:
-//    Files → Android → data → com.robtopx.geometryjump → files → MacroSafeguard
-//
-//  This is why files weren't found before — Mod::get()->getSaveDir()
-//  writes to internal storage which requires root to browse.
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 static std::string getRecordingsDir() {
-    // Save to public internal storage root — visible in ANY file manager
-    // without needing to know the GD package name or navigate Android/data
     std::string dir = "/storage/emulated/0/MacroSafeguard/";
-
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     if (ec) {
         mkdir(dir.c_str(), 0755);
     }
-
     return dir;
 }
 
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  All video + audio recording is Android-only
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 #ifdef GEODE_IS_ANDROID
 
 // ─── RGBA → I420 (YUV420Planar) ──────────────────────────────────
-// Android H.264 encoders require I420, not RGBA.
-// OpenGL returns rows bottom-up so we flip vertically here.
 static void rgbaToI420(
     const uint8_t* rgba, int width, int height,
-    uint8_t* dst)   // [Y plane][U plane][V plane]
+    uint8_t* dst)
 {
     int ySize  = width * height;
     int uvSize = ySize / 4;
@@ -99,14 +91,13 @@ static void rgbaToI420(
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  VideoRecorder — H.264 video encoded to MP4
-//  Frame capture on GL thread; encoding on background thread.
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 class VideoRecorder {
 public:
     static constexpr int TARGET_FPS = 30;
-    static constexpr int BIT_RATE   = 4 * 1024 * 1024; // 4 Mbps
+    static constexpr int BIT_RATE   = 4 * 1024 * 1024;
 
     bool isRecording() const { return m_isRecording.load(); }
 
@@ -129,7 +120,7 @@ public:
         AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_FRAME_RATE,       TARGET_FPS);
         AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_BIT_RATE,         BIT_RATE);
         AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_I_FRAME_INTERVAL, 1);
-        AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_COLOR_FORMAT,     0x13); // I420
+        AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_COLOR_FORMAT,     0x13);
         media_status_t st = AMediaCodec_configure(m_codec, fmt, nullptr, nullptr,
             AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
         AMediaFormat_delete(fmt);
@@ -159,14 +150,11 @@ public:
         return true;
     }
 
-    // Called from GL thread before CCEGLView::swapBuffers.
-    // Back buffer contains the fully rendered current frame at this point.
     void captureFrame() {
         if (!m_isRecording.load()) return;
         auto now = std::chrono::steady_clock::now();
         int64_t elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(
             now - m_recordStart).count();
-        // Rate-limit to TARGET_FPS
         if (elapsedUs < m_capturedFrames * (1'000'000LL / TARGET_FPS)) return;
 
         std::vector<uint8_t> rgba(static_cast<size_t>(m_width * m_height * 4));
@@ -275,21 +263,16 @@ private:
     }
 };
 
-// ═══════════════════════════════════════════════════════════════════
-//  MicRecorder — microphone captured via AAudio → AAC → M4A
-//
-//  This is the separate "clicks" track your friend mentioned.
-//  It contains ONLY your microphone audio (tap sounds / click noise),
-//  with zero game audio mixed in — exactly what Pointercrate needs.
-//
-//  IMPORTANT: GD must have the RECORD_AUDIO Android permission granted.
-//  If mic recording fails to start, video-only recording continues.
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
+//  MicRecorder — microphone via AAudio → AAC → M4A (Android 26+ only)
+// ════════════════════════════════════════════════════════════════[...]
+#if AAUDIO_AVAILABLE
+
 class MicRecorder {
 public:
     static constexpr int SAMPLE_RATE = 44100;
-    static constexpr int CHANNELS    = 1;           // mono mic
-    static constexpr int AAC_BITRATE = 128 * 1024;  // 128 kbps
+    static constexpr int CHANNELS    = 1;
+    static constexpr int AAC_BITRATE = 128 * 1024;
 
     bool isRecording() const { return m_isRecording.load(); }
 
@@ -299,7 +282,6 @@ public:
         m_presentationUs = 0;
         m_startTime = std::chrono::steady_clock::now();
 
-        // ── Open AAudio input stream ──────────────────────────────────────
         AAudioStreamBuilder* builder = nullptr;
         if (AAudio_createStreamBuilder(&builder) != AAUDIO_OK) {
             log::warn("[MacroSafeguard][Mic] AAudio unavailable on this device");
@@ -317,7 +299,6 @@ public:
         AAudioStreamBuilder_delete(builder);
 
         if (res != AAUDIO_OK) {
-            // Most common reason: GD doesn't have RECORD_AUDIO permission
             log::warn("[MacroSafeguard][Mic] Could not open mic stream ({}). "
                       "Grant microphone permission to GD in Android Settings → Apps.",
                       (int)res);
@@ -325,7 +306,6 @@ public:
             return false;
         }
 
-        // ── Setup AAC encoder + M4A muxer ─────────────────────────────────
         if (!setupEncoder(path)) {
             AAudioStream_close(m_stream); m_stream = nullptr; return false;
         }
@@ -401,7 +381,7 @@ private:
         AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_SAMPLE_RATE,    SAMPLE_RATE);
         AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_CHANNEL_COUNT,  CHANNELS);
         AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_BIT_RATE,       AAC_BITRATE);
-        AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_AAC_PROFILE,    2); // AAC-LC
+        AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_AAC_PROFILE,    2);
         media_status_t st = AMediaCodec_configure(m_codec, fmt, nullptr, nullptr,
             AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
         AMediaFormat_delete(fmt);
@@ -428,7 +408,6 @@ private:
         return true;
     }
 
-    // AAudio calls this on a high-priority audio thread for each buffer of samples
     static aaudio_data_callback_result_t dataCallback(
         AAudioStream*, void* userData, void* audioData, int32_t numFrames)
     {
@@ -508,15 +487,30 @@ private:
     }
 };
 
+#else
+
+// Stub for devices without AAudio (< Android 26)
+class MicRecorder {
+public:
+    bool isRecording() const { return false; }
+    bool start(const std::string& path) {
+        log::warn("[MacroSafeguard][Mic] AAudio requires Android 26+, skipping mic recording");
+        return false;
+    }
+    void stop(bool saveFile) {}
+};
+
+#endif
+
 // ─── Android-only globals ─────────────────────────────────────────
 static VideoRecorder g_video;
 static MicRecorder   g_mic;
 
 #endif // GEODE_IS_ANDROID
 
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  Cross-platform globals
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 static bool     g_isPlayLayerActive = false;
 static uint64_t g_currentFrame      = 0;
 
@@ -525,11 +519,9 @@ struct ActionEvent {
 };
 static std::vector<ActionEvent> g_recordedActions;
 
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  CCEGLView hook — Android only
-//  Capture happens BEFORE swapBuffers so the back buffer still
-//  contains the fully rendered current frame.
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 #ifdef GEODE_IS_ANDROID
 class $modify(MyCCEGLView, CCEGLView) {
     void swapBuffers() {
@@ -539,9 +531,9 @@ class $modify(MyCCEGLView, CCEGLView) {
 };
 #endif
 
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  PlayLayer hook — all platforms
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 class $modify(MyPlayLayer, PlayLayer) {
     struct Fields {
         int  m_previousBest          = 0;
@@ -566,12 +558,10 @@ class $modify(MyPlayLayer, PlayLayer) {
         return true;
     }
 
-    // Starts fresh video + mic recording for the upcoming attempt
     void startNewRecording() {
         if (m_fields->m_hasQuit) return;
 
 #ifdef GEODE_IS_ANDROID
-        // Stop any leftover recordings before starting new ones
         if (g_video.isRecording()) g_video.stop(false);
         if (g_mic.isRecording())   g_mic.stop(false);
 
@@ -579,21 +569,18 @@ class $modify(MyPlayLayer, PlayLayer) {
         auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
 
-        // Two separate files per attempt, same timestamp prefix
         std::string videoPath  = dir + std::to_string(ms) + "_video.mp4";
         std::string clicksPath = dir + std::to_string(ms) + "_clicks.m4a";
 
         auto* view   = CCDirector::sharedDirector()->getOpenGLView();
         auto  size   = view->getFrameSize();
-        int   width  = static_cast<int>(size.width)  & ~1; // H.264 needs even dims
+        int   width  = static_cast<int>(size.width)  & ~1;
         int   height = static_cast<int>(size.height) & ~1;
 
         if (!g_video.start(videoPath, width, height)) {
             log::error("[MacroSafeguard] Video recorder failed to start");
         }
 
-        // Mic recording is best-effort: if GD lacks RECORD_AUDIO permission,
-        // this returns false and we continue with video-only.
         if (!g_mic.start(clicksPath)) {
             log::warn("[MacroSafeguard] Mic unavailable — "
                       "go to Android Settings → Apps → GD → Permissions "
@@ -602,7 +589,6 @@ class $modify(MyPlayLayer, PlayLayer) {
 #endif
     }
 
-    // Evaluates the attempt and saves or discards both recordings
     void checkAndSaveIfQualified() {
         if (m_fields->m_hasSavedThisAttempt) return;
 
@@ -615,13 +601,11 @@ class $modify(MyPlayLayer, PlayLayer) {
         } else {
             shouldSave = (m_fields->m_maxPercentThisAttempt >= static_cast<int>(threshold));
         }
-        // Always save a full level clear regardless of setting
         if (m_fields->m_maxPercentThisAttempt >= 100) shouldSave = true;
 
         m_fields->m_hasSavedThisAttempt = true;
 
 #ifdef GEODE_IS_ANDROID
-        // Check BEFORE stopping — isRecording() becomes false inside stop()
         bool hadVideo = g_video.isRecording();
         bool hadMic   = g_mic.isRecording();
 
@@ -629,7 +613,6 @@ class $modify(MyPlayLayer, PlayLayer) {
         g_mic.stop(shouldSave);
 
         if (shouldSave) {
-            // Build a clear notification based on what was actually recorded
             std::string msg;
             if (hadVideo && hadMic) {
                 msg = "Saved! Video + clicks in MacroSafeguard folder";
@@ -645,11 +628,9 @@ class $modify(MyPlayLayer, PlayLayer) {
 #endif
     }
 
-    // resetLevel fires on death AND on retry — covers both cases the user mentioned
     void resetLevel() {
         checkAndSaveIfQualified();
 
-        // Snapshot BEFORE calling super; GD updates m_normalPercent before resetLevel
         int newBest = this->m_level ? this->m_level->m_normalPercent : 0;
 
         PlayLayer::resetLevel();
@@ -663,7 +644,6 @@ class $modify(MyPlayLayer, PlayLayer) {
         startNewRecording();
     }
 
-    // levelComplete fires when you beat the level
     void levelComplete() {
         m_fields->m_maxPercentThisAttempt = 100;
         checkAndSaveIfQualified();
@@ -680,9 +660,8 @@ class $modify(MyPlayLayer, PlayLayer) {
         }
     }
 
-    // onQuit catches force-quits mid-attempt
     void onQuit() {
-        m_fields->m_hasQuit = true; // prevents startNewRecording if resetLevel fires internally
+        m_fields->m_hasQuit = true;
         checkAndSaveIfQualified();
         g_isPlayLayerActive = false;
         g_recordedActions.clear();
@@ -690,9 +669,9 @@ class $modify(MyPlayLayer, PlayLayer) {
     }
 };
 
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  PlayerObject hook — all platforms
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 class $modify(MyPlayerObject, PlayerObject) {
     void pushButton(PlayerButton button) {
         PlayerObject::pushButton(button);
