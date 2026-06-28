@@ -12,7 +12,8 @@
     "developer": "brky1972",
     "description": "Macro Safeguard: Automatically records attempts when beating personal bests.",
     "dependencies": {
-        "geode.node-ids": ">=v1.23.3"
+        "geode.node-ids": ">=v1.23.3",
+        "eclipse.ffmpeg-api": ">=2.0.0"
     },
     "settings": {
         "only-new-best": {
@@ -31,4 +32,5 @@
             "enable-if": "!only-new-best"
         }
     }
-}	
+}
+

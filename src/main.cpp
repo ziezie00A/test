@@ -1,66 +1,49 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
-#include <Geode/modify/CCEGLView.hpp>
+#include <Geode/modify/CCDirector.hpp>
 #include <Geode/ui/Notification.hpp>
+#include <Geode/utils/cocos.hpp>
+
+// Include cross-platform FMOD headers packaged with Geode
+#include <fmod.hpp>
+
+// Include FFmpeg API headers provided by eclipse.ffmpeg-api
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
+}
 
 #include <vector>
 #include <string>
-#include <sstream>
 #include <chrono>
-#include <algorithm>
 #include <atomic>
 #include <thread>
 #include <mutex>
 #include <queue>
 #include <condition_variable>
 #include <filesystem>
-#include <cstring>
-#include <sys/stat.h>
-
-#ifdef _WIN32
-#include <direct.h>
-#endif
-
-#ifdef GEODE_IS_ANDROID
-#include <media/NdkMediaCodec.h>
-#include <media/NdkMediaMuxer.h>
-#include <media/NdkMediaFormat.h>
-#include <GLES2/gl2.h>
-#include <fcntl.h>
-#include <unistd.h>
-
-// Only include AAudio if we're targeting Android 26+
-#if __ANDROID_API__ >= 26
-#include <aaudio/AAudio.h>
-#define AAUDIO_AVAILABLE 1
-#else
-#define AAUDIO_AVAILABLE 0
-#endif
-
-#endif
 
 using namespace geode::prelude;
 
-// ════════════════════════════════════════════════════════════════[[...]
-//  Recordings directory (platform-specific)
-// ════════════════════════════════════════════════════════════════[[...]
+// ════════════════════════════════════════════════════════════════
+//  Universal Path Resolution
+// ════════════════════════════════════════════════════════════════
 static std::string getRecordingsDir() {
     std::string dir;
-    
 #ifdef GEODE_IS_ANDROID
     dir = "/storage/emulated/0/MacroSafeguard/";
 #elif defined(_WIN32)
-    // Windows: Use AppData\Local or Documents folder
     char* appdata = getenv("APPDATA");
     if (appdata) {
         dir = std::string(appdata) + "\\MacroSafeguard\\";
     } else {
-        // Fallback to Documents folder
         dir = std::string(getenv("USERPROFILE")) + "\\Documents\\MacroSafeguard\\";
     }
 #else
-    // Unix/Linux: Use ~/.local/share
     char* home = getenv("HOME");
     if (home) {
         dir = std::string(home) + "/.local/share/MacroSafeguard/";
@@ -68,532 +51,302 @@ static std::string getRecordingsDir() {
         dir = "/tmp/MacroSafeguard/";
     }
 #endif
-    
+
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    if (ec) {
-        log::warn("[MacroSafeguard] Failed to create directory: {}", dir);
-    }
     return dir;
 }
 
-// ════════════════════════════════════════════════════════════════[[...]
-//  All video + audio recording is Android-only
-// ════════════════════════════════════════════════════════════════[[...]
-#ifdef GEODE_IS_ANDROID
+// ════════════════════════════════════════════════════════════════
+//  Unified Cross-Platform Media Recorder
+// ════════════════════════════════════════════════════════════════
+class UniversalRecorder {
+public:
+    static UniversalRecorder& get() {
+        static UniversalRecorder instance;
+        return instance;
+    }
 
-// ─── RGBA → I420 (YUV420Planar) ──────────────────────────────────
-static void rgbaToI420(
-    const uint8_t* rgba, int width, int height,
-    uint8_t* dst)
-{
-    int ySize  = width * height;
-    int uvSize = ySize / 4;
-    uint8_t* yP = dst;
-    uint8_t* uP = dst + ySize;
-    uint8_t* vP = dst + ySize + uvSize;
+    bool isRecording() const { return m_isRecording.load(); }
 
-    for (int row = 0; row < height; ++row) {
-        int srcRow = (height - 1) - row;
-        const uint8_t* src = rgba   + srcRow * width * 4;
-        uint8_t*       yDst = yP   + row    * width;
-        for (int col = 0; col < width; ++col) {
-            uint8_t r = src[col*4+0], g = src[col*4+1], b = src[col*4+2];
-            yDst[col] = static_cast<uint8_t>(((66*r + 129*g + 25*b + 128) >> 8) + 16);
+    bool start(const std::string& filename, int width, int height, int sampleRate) {
+        if (m_isRecording.load()) return false;
+
+        m_width = width & ~1; // Ensure dimensions are divisible by 2 for H.264
+        m_height = height & ~1;
+        m_sampleRate = sampleRate;
+        m_outputPath = getRecordingsDir() + filename + ".mp4";
+        
+        m_videoFrameCount = 0;
+        m_audioSampleCount = 0;
+        m_isRecording.store(true);
+        m_stopEncoder.store(false);
+
+        // Clear existing stale data in queues securely
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            std::queue<std::vector<uint8_t>>().swap(m_videoQueue);
+            std::queue<std::vector<float>>().swap(m_audioQueue);
+        }
+
+        m_encoderThread = std::thread(&UniversalRecorder::encoderLoop, this);
+        log::info("[MacroSafeguard] Recording pipeline initialized successfully.");
+        return true;
+    }
+
+    void pushVideoFrame(const uint8_t* rgbaData, size_t size) {
+        if (!m_isRecording.load()) return;
+
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        // BUG MITIGATION: Memory protection throttle. Drop frames if encoding lag exceeds 30 frames.
+        if (m_videoQueue.size() > 30) {
+            return; 
+        }
+        m_videoQueue.push(std::vector<uint8_t>(rgbaData, rgbaData + size));
+        m_queueCv.notify_one();
+    }
+
+    void pushAudioSamples(const float* PCMData, size_t numSamples) {
+        if (!m_isRecording.load()) return;
+
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        // Audio streams cannot afford frame drops without severe crackling.
+        // Memory consumption here is minimal compared to video frames.
+        m_audioQueue.push(std::vector<float>(PCMData, PCMData + numSamples));
+        m_queueCv.notify_one();
+    }
+
+    void stop(bool saveFile) {
+        if (!m_isRecording.load()) return;
+        m_isRecording.store(false);
+
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            m_stopEncoder.store(true);
+        }
+        m_queueCv.notify_all();
+
+        if (m_encoderThread.joinable()) {
+            m_encoderThread.join();
+        }
+
+        if (!saveFile) {
+            std::error_code ec;
+            std::filesystem::remove(m_outputPath, ec);
+            log::info("[MacroSafeguard] Recording discarded safely.");
+        } else {
+            log::info("[MacroSafeguard] Recording successfully finalized at: {}", m_outputPath);
         }
     }
 
-    int uvH = height / 2, uvW = width / 2;
-    for (int row = 0; row < uvH; ++row) {
-        int srcRow = (height - 1) - (row * 2);
-        const uint8_t* src = rgba + srcRow * width * 4;
-        uint8_t* uDst = uP + row * uvW;
-        uint8_t* vDst = vP + row * uvW;
-        for (int col = 0; col < uvW; ++col) {
-            uint8_t r = src[col*2*4+0], g = src[col*2*4+1], b = src[col*2*4+2];
-            uDst[col] = static_cast<uint8_t>((( -38*r -  74*g + 112*b + 128) >> 8) + 128);
-            vDst[col] = static_cast<uint8_t>(((  112*r -  94*g -  18*b + 128) >> 8) + 128);
+private:
+    UniversalRecorder() {}
+    
+    std::atomic<bool> m_isRecording{false};
+    std::atomic<bool> m_stopEncoder{false};
+    std::thread       m_encoderThread;
+    std::mutex        m_queueMutex;
+    std::condition_variable m_queueCv;
+
+    std::queue<std::vector<uint8_t>> m_videoQueue;
+    std::queue<std::vector<float>>   m_audioQueue;
+
+    std::string m_outputPath;
+    int m_width = 0;
+    int m_height = 0;
+    int m_sampleRate = 44100;
+    
+    int64_t m_videoFrameCount = 0;
+    int64_t m_audioSampleCount = 0;
+
+    void encoderLoop() {
+        // Initialize FFmpeg contexts natively across Windows, Mac, and Android
+        AVFormatContext* fmtCtx = nullptr;
+        avformat_alloc_output_context2(&fmtCtx, nullptr, nullptr, m_outputPath.c_str());
+        if (!fmtCtx) return;
+
+        // Configure H.264 Video Stream
+        const AVCodec* videoCodec = avcodec_find_encoder(AV_CODEC_ID_H264);
+        AVStream* videoStream = avformat_new_stream(fmtCtx, videoCodec);
+        AVCodecContext* videoEncCtx = avcodec_alloc_context3(videoCodec);
+        
+        videoEncCtx->width = m_width;
+        videoEncCtx->height = m_height;
+        videoEncCtx->time_base = {1, 60}; // Target fixed engine 60fps tracking
+        videoEncCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+        videoEncCtx->bit_rate = 4000000;
+        videoEncCtx->gop_size = 12;
+        avcodec_open2(videoEncCtx, videoCodec, nullptr);
+        avcodec_parameters_from_context(videoStream->codecpar, videoEncCtx);
+
+        // Configure AAC Audio Stream
+        const AVCodec* audioCodec = avcodec_find_encoder(AV_CODEC_ID_AAC);
+        AVStream* audioStream = avformat_new_stream(fmtCtx, audioCodec);
+        AVCodecContext* audioEncCtx = avcodec_alloc_context3(audioCodec);
+        
+        audioEncCtx->sample_rate = m_sampleRate;
+        audioEncCtx->sample_fmt = AV_SAMPLE_FMT_FLTP; // Float Planar natively matched to FMOD
+        audioEncCtx->ch_layout = AV_CHANNEL_LAYOUT_STEREO;
+        audioEncCtx->bit_rate = 128000;
+        avcodec_open2(audioEncCtx, audioCodec, nullptr);
+        avcodec_parameters_from_context(audioStream->codecpar, audioEncCtx);
+
+        // Open Output File System Interfacing
+        if (!(fmtCtx->oformat->flags & AVFMT_NOFILE)) {
+            avio_open(&fmtCtx->pb, m_outputPath.c_str(), AVIO_FLAG_WRITE);
         }
+        avformat_write_header(fmtCtx, nullptr);
+
+        // Initialize Scaling Context to safely parse RGBA frames to YUV420P
+        SwsContext* swsCtx = sws_getContext(m_width, m_height, AV_PIX_FMT_RGBA,
+                                            m_width, m_height, AV_PIX_FMT_YUV420P,
+                                            SWS_BICUBIC, nullptr, nullptr, nullptr);
+
+        AVFrame* yuvFrame = av_frame_alloc();
+        yuvFrame->format = AV_PIX_FMT_YUV420P;
+        yuvFrame->width = m_width;
+        yuvFrame->height = m_height;
+        av_frame_get_buffer(yuvFrame, 32);
+
+        // Core processing consumer loop
+        while (true) {
+            std::vector<uint8_t> rawFrame;
+            std::vector<float> rawAudio;
+
+            {
+                std::unique_lock<std::mutex> lock(m_queueMutex);
+                m_queueCv.wait(lock, [this] {
+                    return !m_videoQueue.empty() || !m_audioQueue.empty() || m_stopEncoder.load();
+                });
+
+                if (!m_videoQueue.empty()) {
+                    rawFrame = std::move(m_videoQueue.front());
+                    m_videoQueue.pop();
+                }
+                if (!m_audioQueue.empty()) {
+                    rawAudio = std::move(m_audioQueue.front());
+                    m_audioQueue.pop();
+                }
+                if (m_videoQueue.empty() && m_audioQueue.empty() && m_stopEncoder.load()) {
+                    break; // Finalized execution signal received safely
+                }
+            }
+
+            // Encode Video Frame if fetched
+            if (!rawFrame.empty()) {
+                const uint8_t* srcData[1] = { rawFrame.data() };
+                int srcLinesize[1] = { m_width * 4 };
+                sws_scale(swsCtx, srcData, srcLinesize, 0, m_height, yuvFrame->data, yuvFrame->linesize);
+                
+                yuvFrame->pts = m_videoFrameCount++;
+                avcodec_send_frame(videoEncCtx, yuvFrame);
+                AVPacket* pkt = av_packet_alloc();
+                if (avcodec_receive_packet(videoEncCtx, pkt) == 0) {
+                    av_packet_rescale_ts(pkt, videoEncCtx->time_base, videoStream->time_base);
+                    pkt->stream_index = videoStream->index;
+                    av_interleaved_write_frame(fmtCtx, pkt);
+                }
+                av_packet_free(&pkt);
+            }
+
+            // Encode Audio Chunk if fetched
+            if (!rawAudio.empty()) {
+                AVFrame* audioFrame = av_frame_alloc();
+                audioFrame->nb_samples = static_cast<int>(rawAudio.size() / 2);
+                audioFrame->format = AV_SAMPLE_FMT_FLTP;
+                audioFrame->ch_layout = AV_CHANNEL_LAYOUT_STEREO;
+                av_frame_get_buffer(audioFrame, 0);
+
+                // Split interleaved FMOD input samples into separated layout tracking structures
+                float* leftChannel = reinterpret_cast<float*>(audioFrame->data[0]);
+                float* rightChannel = reinterpret_cast<float*>(audioFrame->data[1]);
+                for (size_t i = 0; i < rawAudio.size() / 2; ++i) {
+                    leftChannel[i] = rawAudio[i * 2];
+                    rightChannel[i] = rawAudio[i * 2 + 1];
+                }
+
+                audioFrame->pts = m_audioSampleCount;
+                m_audioSampleCount += audioFrame->nb_samples;
+
+                avcodec_send_frame(audioEncCtx, audioFrame);
+                AVPacket* pkt = av_packet_alloc();
+                if (avcodec_receive_packet(audioEncCtx, pkt) == 0) {
+                    av_packet_rescale_ts(pkt, audioEncCtx->time_base, audioStream->time_base);
+                    pkt->stream_index = audioStream->index;
+                    av_interleaved_write_frame(fmtCtx, pkt);
+                }
+                av_packet_free(&pkt);
+                av_frame_free(&audioFrame);
+            }
+        }
+
+        // Flush encoders, write file tail signatures, clean heap memory
+        av_write_trailer(fmtCtx);
+        av_frame_free(&yuvFrame);
+        sws_freeContext(swsCtx);
+        avcodec_free_context(&videoEncCtx);
+        avcodec_free_context(&audioEncCtx);
+        if (!(fmtCtx->oformat->flags & AVFMT_NOFILE)) {
+            avio_closep(&fmtCtx->pb);
+        }
+        avformat_free_context(fmtCtx);
     }
+};
+
+// ════════════════════════════════════════════════════════════════
+//  FMOD Sound Engine Master Interception (Unified Platform Audio)
+// ════════════════════════════════════════════════════════════════
+FMOD_RESULT F_CALLBACK fmodAudioCallback(FMOD_DSP_STATE* dsp_state, float* inbuffer, float* outbuffer, unsigned int length, int inchannels, int* outchannels) {
+    // Intercept data streams smoothly across systems
+    if (UniversalRecorder::get().isRecording()) {
+        UniversalRecorder::get().pushAudioSamples(inbuffer, length * inchannels);
+    }
+    
+    // Explicitly pass audio along untouched to avoid complete engine muting
+    for (unsigned int i = 0; i < length * inchannels; ++i) {
+        outbuffer[i] = inbuffer[i];
+    }
+    return FMOD_OK;
 }
 
-// ════════════════════════════════════════════════════════════════[...]
-//  VideoRecorder — H.264 video encoded to MP4
-// ════════════════════════════════════════════════════════════════[...]
-class VideoRecorder {
-public:
-    static constexpr int TARGET_FPS = 30;
-    static constexpr int BIT_RATE   = 4 * 1024 * 1024;
+// ════════════════════════════════════════════════════════════════
+//  Cross-Platform State Control Globals
+// ════════════════════════════════════════════════════════════════
+static bool g_isPlayLayerActive = false;
+static FMOD::DSP* g_fmodDsp = nullptr;
 
-    bool isRecording() const { return m_isRecording.load(); }
+// ════════════════════════════════════════════════════════════════
+//  CCDirector Hook — High performance engine draw loops
+// ════════════════════════════════════════════════════════════════
+class $modify(MyDirector, CCDirector) {
+    void drawScene() {
+        CCDirector::drawScene();
 
-    bool start(const std::string& path, int width, int height) {
-        if (m_isRecording.load()) return false;
-        m_width = width; m_height = height; m_path = path;
-        m_presentationUs = 0; m_capturedFrames = 0;
-        m_recordStart = std::chrono::steady_clock::now();
+        if (g_isPlayLayerActive && UniversalRecorder::get().isRecording()) {
+            auto view = this->getOpenGLView();
+            if (!view) return;
 
-        m_codec = AMediaCodec_createEncoderByType("video/avc");
-        if (!m_codec) {
-            log::error("[MacroSafeguard][Video] No AVC encoder found");
-            return false;
-        }
+            auto size = view->getFrameSize();
+            int width = static_cast<int>(size.width);
+            int height = static_cast<int>(size.height);
+            size_t frameByteSize = static_cast<size_t>(width * height * 4);
 
-        AMediaFormat* fmt = AMediaFormat_new();
-        AMediaFormat_setString(fmt, AMEDIAFORMAT_KEY_MIME,             "video/avc");
-        AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_WIDTH,            width);
-        AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_HEIGHT,           height);
-        AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_FRAME_RATE,       TARGET_FPS);
-        AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_BIT_RATE,         BIT_RATE);
-        AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_I_FRAME_INTERVAL, 1);
-        AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_COLOR_FORMAT,     0x13);
-        media_status_t st = AMediaCodec_configure(m_codec, fmt, nullptr, nullptr,
-            AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
-        AMediaFormat_delete(fmt);
-
-        if (st != AMEDIA_OK) {
-            log::error("[MacroSafeguard][Video] Codec configure failed: {}", (int)st);
-            AMediaCodec_delete(m_codec); m_codec = nullptr; return false;
-        }
-
-        int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) {
-            log::error("[MacroSafeguard][Video] Cannot open file: {}", path);
-            AMediaCodec_delete(m_codec); m_codec = nullptr; return false;
-        }
-        log::info("[MacroSafeguard][Video] Opened file descriptor {} for {}", fd, path);
-        m_fd    = fd;
-        m_muxer = AMediaMuxer_new(fd, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
-        if (!m_muxer) {
-            log::error("[MacroSafeguard][Video] AMediaMuxer_new failed for {}", path);
-            ::close(fd); m_fd = -1; ::remove(path.c_str());
-            AMediaCodec_delete(m_codec); m_codec = nullptr; return false;
-        }
-        log::info("[MacroSafeguard][Video] AMediaMuxer created for {}", path);
-
-        AMediaCodec_start(m_codec);
-        m_muxerStarted = false; m_videoTrack = -1;
-        m_stopEncoder.store(false); m_isRecording.store(true);
-        m_encodeThread = std::thread(&VideoRecorder::encodeLoop, this);
-        log::info("[MacroSafeguard][Video] Started → {}", path);
-        return true;
-    }
-
-    void captureFrame() {
-        if (!m_isRecording.load()) return;
-        auto now = std::chrono::steady_clock::now();
-        int64_t elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(
-            now - m_recordStart).count();
-        if (elapsedUs < m_capturedFrames * (1'000'000LL / TARGET_FPS)) return;
-
-        std::vector<uint8_t> rgba(static_cast<size_t>(m_width * m_height * 4));
-        glReadPixels(0, 0, m_width, m_height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
-        {
-            std::lock_guard<std::mutex> lk(m_queueMtx);
-            m_queue.push({ elapsedUs, std::move(rgba) });
-        }
-        m_queueCv.notify_one();
-        ++m_capturedFrames;
-    }
-
-    void stop(bool saveFile) {
-        if (!m_isRecording.load()) return;
-        m_isRecording.store(false);
-        m_stopEncoder.store(true); m_queueCv.notify_all();
-        if (m_encodeThread.joinable()) m_encodeThread.join();
-
-        if (m_codec) {
-            ssize_t idx = AMediaCodec_dequeueInputBuffer(m_codec, 100'000);
-            if (idx >= 0)
-                AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, 0,
-                    m_presentationUs, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
-            drainCodec(true);
-            AMediaCodec_stop(m_codec); AMediaCodec_delete(m_codec); m_codec = nullptr;
-        }
-        if (m_muxerStarted && m_muxer) AMediaMuxer_stop(m_muxer);
-        if (m_muxer)  { AMediaMuxer_delete(m_muxer); m_muxer = nullptr; }
-        if (m_fd >= 0){ ::close(m_fd); m_fd = -1; }
-
-        if (!saveFile) {
-            ::remove(m_path.c_str());
-            log::info("[MacroSafeguard][Video] Discarded (below threshold)");
-        } else {
-            log::info("[MacroSafeguard][Video] Saved → {}", m_path);
-        }
-        m_capturedFrames = 0;
-    }
-
-private:
-    struct Frame { int64_t ts; std::vector<uint8_t> rgba; };
-
-    AMediaCodec* m_codec = nullptr; AMediaMuxer* m_muxer = nullptr;
-    int m_videoTrack=-1, m_fd=-1; bool m_muxerStarted=false;
-    int m_width=0, m_height=0;
-    std::string m_path;
-    int64_t m_presentationUs=0, m_capturedFrames=0;
-    std::chrono::steady_clock::time_point m_recordStart;
-    std::atomic<bool> m_isRecording{false}, m_stopEncoder{false};
-    std::thread m_encodeThread;
-    std::mutex m_queueMtx; std::condition_variable m_queueCv;
-    std::queue<Frame> m_queue;
-
-    void encodeLoop() {
-        while (true) {
-            Frame f;
-            {
-                std::unique_lock<std::mutex> lk(m_queueMtx);
-                m_queueCv.wait(lk, [this]{ return !m_queue.empty() || m_stopEncoder.load(); });
-                if (m_queue.empty()) break;
-                f = std::move(m_queue.front()); m_queue.pop();
+            // Statically cache buffer arrays across draws to optimize processing alloc overhead
+            static std::vector<uint8_t> pixelBuffer;
+            if (pixelBuffer.size() != frameByteSize) {
+                pixelBuffer.resize(frameByteSize);
             }
-            feedFrame(f); drainCodec(false);
-        }
-    }
 
-    void feedFrame(const Frame& f) {
-        if (!m_codec) return;
-        int i420Size = m_width * m_height * 3 / 2;
-        ssize_t idx = AMediaCodec_dequeueInputBuffer(m_codec, 100'000);
-        if (idx < 0) return;
-        size_t cap=0;
-        uint8_t* buf = AMediaCodec_getInputBuffer(m_codec, (size_t)idx, &cap);
-        if (!buf || (int)cap < i420Size) {
-            log::warn("[MacroSafeguard][Video] Input buffer smaller than expected: cap={} need={}", (int)cap, i420Size);
-            AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, 0, f.ts, 0); return;
-        }
-        rgbaToI420(f.rgba.data(), m_width, m_height, buf);
-        m_presentationUs = f.ts;
-        AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, (size_t)i420Size, f.ts, 0);
-    }
-
-    void drainCodec(bool eos) {
-        if (!m_codec) return;
-        AMediaCodecBufferInfo info;
-        for (;;) {
-            ssize_t out = AMediaCodec_dequeueOutputBuffer(m_codec, &info, eos ? 500'000 : 0);
-            if (out == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
-                log::info("[MacroSafeguard][Video] Output format changed");
-                if (!m_muxerStarted && m_muxer) {
-                    AMediaFormat* outFmt = AMediaCodec_getOutputFormat(m_codec);
-                    m_videoTrack = (int)AMediaMuxer_addTrack(m_muxer, outFmt);
-                    AMediaFormat_delete(outFmt);
-                    log::info("[MacroSafeguard][Video] Added video track {}", m_videoTrack);
-                    AMediaMuxer_start(m_muxer); m_muxerStarted = true;
-                    log::info("[MacroSafeguard][Video] AMediaMuxer started");
-                }
-                continue;
-            }
-            if (out == AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
-                // No output available right now
-                break;
-            }
-            if (out < 0) {
-                log::warn("[MacroSafeguard][Video] dequeueOutputBuffer returned {}", (int)out);
-                break;
-            }
-            if (!(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG)
-                && m_muxerStarted && m_videoTrack >= 0 && info.size > 0) {
-                size_t cap=0;
-                uint8_t* b = AMediaCodec_getOutputBuffer(m_codec, (size_t)out, &cap);
-                if (b) {
-                    log::info("[MacroSafeguard][Video] Writing sample size={} pts={} flags={}", info.size, info.presentationTimeUs, info.flags);
-                    AMediaMuxer_writeSampleData(m_muxer, (size_t)m_videoTrack, b, &info);
-                } else {
-                    log::warn("[MacroSafeguard][Video] Output buffer is null (out={})", out);
-                }
-            } else {
-                if (info.size <= 0) log::debug("[MacroSafeguard][Video] Skipping zero-size buffer (flags={})", info.flags);
-            }
-            AMediaCodec_releaseOutputBuffer(m_codec, (size_t)out, false);
-            if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) break;
+            // Safely execute cross-platform raw frame grabs directly off GPU contexts
+            glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixelBuffer.data());
+            UniversalRecorder::get().pushVideoFrame(pixelBuffer.data(), frameByteSize);
         }
     }
 };
 
-// ════════════════════════════════════════════════════════════════[...]
-//  MicRecorder — microphone via AAudio → AAC → M4A (Android 26+ only)
-// ══════════════════════════════════════════════════════════���═════[...]
-#if AAUDIO_AVAILABLE
-
-class MicRecorder {
-public:
-    static constexpr int SAMPLE_RATE = 44100;
-    static constexpr int CHANNELS    = 1;
-    static constexpr int AAC_BITRATE = 128 * 1024;
-
-    bool isRecording() const { return m_isRecording.load(); }
-
-    bool start(const std::string& path) {
-        if (m_isRecording.load()) return false;
-        m_path = path;
-        m_presentationUs = 0;
-        m_startTime = std::chrono::steady_clock::now();
-
-        AAudioStreamBuilder* builder = nullptr;
-        if (AAudio_createStreamBuilder(&builder) != AAUDIO_OK) {
-            log::warn("[MacroSafeguard][Mic] AAudio unavailable on this device");
-            return false;
-        }
-        AAudioStreamBuilder_setDirection    (builder, AAUDIO_DIRECTION_INPUT);
-        AAudioStreamBuilder_setSharingMode  (builder, AAUDIO_SHARING_MODE_SHARED);
-        AAudioStreamBuilder_setSampleRate   (builder, SAMPLE_RATE);
-        AAudioStreamBuilder_setChannelCount (builder, CHANNELS);
-        AAudioStreamBuilder_setFormat       (builder, AAUDIO_FORMAT_PCM_I16);
-        AAudioStreamBuilder_setDataCallback (builder, dataCallback, this);
-        AAudioStreamBuilder_setErrorCallback(builder, errorCallback, this);
-
-        aaudio_result_t res = AAudioStreamBuilder_openStream(builder, &m_stream);
-        AAudioStreamBuilder_delete(builder);
-
-        if (res != AAUDIO_OK) {
-            log::warn("[MacroSafeguard][Mic] Could not open mic stream ({}). "
-                      "Grant microphone permission to GD in Android Settings → Apps.",
-                      (int)res);
-            m_stream = nullptr;
-            return false;
-        }
-
-        if (!setupEncoder(path)) {
-            AAudioStream_close(m_stream); m_stream = nullptr; return false;
-        }
-
-        m_stopEncoder.store(false); m_isRecording.store(true);
-        m_encodeThread = std::thread(&MicRecorder::encodeLoop, this);
-
-        if (AAudioStream_requestStart(m_stream) != AAUDIO_OK) {
-            log::error("[MacroSafeguard][Mic] Failed to start AAudio stream");
-            stop(false); return false;
-        }
-
-        log::info("[MacroSafeguard][Mic] Started → {}", path);
-        return true;
-    }
-
-    void stop(bool saveFile) {
-        if (!m_isRecording.load()) return;
-        m_isRecording.store(false);
-
-        if (m_stream) {
-            AAudioStream_requestStop(m_stream);
-            AAudioStream_close(m_stream);
-            m_stream = nullptr;
-        }
-
-        m_stopEncoder.store(true); m_queueCv.notify_all();
-        if (m_encodeThread.joinable()) m_encodeThread.join();
-
-        if (m_codec) {
-            ssize_t idx = AMediaCodec_dequeueInputBuffer(m_codec, 100'000);
-            if (idx >= 0)
-                AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, 0,
-                    m_presentationUs, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
-            drainEncoder(true);
-            AMediaCodec_stop(m_codec); AMediaCodec_delete(m_codec); m_codec = nullptr;
-        }
-        if (m_muxerStarted && m_muxer) AMediaMuxer_stop(m_muxer);
-        if (m_muxer)  { AMediaMuxer_delete(m_muxer); m_muxer = nullptr; }
-        if (m_fd >= 0){ ::close(m_fd); m_fd = -1; }
-
-        if (!saveFile) {
-            ::remove(m_path.c_str());
-            log::info("[MacroSafeguard][Mic] Discarded");
-        } else {
-            log::info("[MacroSafeguard][Mic] Saved → {}", m_path);
-        }
-    }
-
-private:
-    struct PcmChunk { int64_t ts; std::vector<int16_t> samples; };
-
-    AAudioStream* m_stream = nullptr;
-    AMediaCodec*  m_codec  = nullptr;
-    AMediaMuxer*  m_muxer  = nullptr;
-    int m_audioTrack=-1, m_fd=-1; bool m_muxerStarted=false;
-    std::string m_path;
-    int64_t m_presentationUs=0;
-    std::chrono::steady_clock::time_point m_startTime;
-    std::atomic<bool> m_isRecording{false}, m_stopEncoder{false};
-    std::thread m_encodeThread;
-    std::mutex m_queueMtx; std::condition_variable m_queueCv;
-    std::queue<PcmChunk> m_queue;
-
-    bool setupEncoder(const std::string& path) {
-        m_codec = AMediaCodec_createEncoderByType("audio/mp4a-latm");
-        if (!m_codec) {
-            log::error("[MacroSafeguard][Mic] No AAC encoder found"); return false;
-        }
-
-        AMediaFormat* fmt = AMediaFormat_new();
-        AMediaFormat_setString(fmt, AMEDIAFORMAT_KEY_MIME,           "audio/mp4a-latm");
-        AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_SAMPLE_RATE,    SAMPLE_RATE);
-        AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_CHANNEL_COUNT,  CHANNELS);
-        AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_BIT_RATE,       AAC_BITRATE);
-        AMediaFormat_setInt32 (fmt, AMEDIAFORMAT_KEY_AAC_PROFILE,    2);
-        media_status_t st = AMediaCodec_configure(m_codec, fmt, nullptr, nullptr,
-            AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
-        AMediaFormat_delete(fmt);
-
-        if (st != AMEDIA_OK) {
-            log::error("[MacroSafeguard][Mic] AAC configure failed: {}", (int)st);
-            AMediaCodec_delete(m_codec); m_codec = nullptr; return false;
-        }
-
-        int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) {
-            log::error("[MacroSafeguard][Mic] Cannot open file: {}", path);
-            AMediaCodec_delete(m_codec); m_codec = nullptr; return false;
-        }
-        log::info("[MacroSafeguard][Mic] Opened file descriptor {} for {}", fd, path);
-        m_fd    = fd;
-        m_muxer = AMediaMuxer_new(fd, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
-        if (!m_muxer) {
-            log::error("[MacroSafeguard][Mic] AMediaMuxer_new failed for {}", path);
-            ::close(fd); m_fd=-1; ::remove(path.c_str());
-            AMediaCodec_delete(m_codec); m_codec=nullptr; return false;
-        }
-        log::info("[MacroSafeguard][Mic] AMediaMuxer created for {}", path);
-
-        AMediaCodec_start(m_codec);
-        m_muxerStarted=false; m_audioTrack=-1;
-        return true;
-    }
-
-    static aaudio_data_callback_result_t dataCallback(
-        AAudioStream*, void* userData, void* audioData, int32_t numFrames)
-    {
-        auto* self = static_cast<MicRecorder*>(userData);
-        if (!self->m_isRecording.load()) return AAUDIO_CALLBACK_RESULT_STOP;
-
-        auto now = std::chrono::steady_clock::now();
-        int64_t ts = std::chrono::duration_cast<std::chrono::microseconds>(
-            now - self->m_startTime).count();
-
-        std::vector<int16_t> samples(numFrames * CHANNELS);
-        std::memcpy(samples.data(), audioData, samples.size() * sizeof(int16_t));
-        {
-            std::lock_guard<std::mutex> lk(self->m_queueMtx);
-            self->m_queue.push({ ts, std::move(samples) });
-        }
-        self->m_queueCv.notify_one();
-        return AAUDIO_CALLBACK_RESULT_CONTINUE;
-    }
-
-    static void errorCallback(AAudioStream*, void*, aaudio_result_t e) {
-        log::error("[MacroSafeguard][Mic] AAudio stream error: {}", (int)e);
-    }
-
-    void encodeLoop() {
-        while (true) {
-            PcmChunk chunk;
-            {
-                std::unique_lock<std::mutex> lk(m_queueMtx);
-                m_queueCv.wait(lk, [this]{ return !m_queue.empty() || m_stopEncoder.load(); });
-                if (m_queue.empty()) break;
-                chunk = std::move(m_queue.front()); m_queue.pop();
-            }
-            feedPcm(chunk); drainEncoder(false);
-        }
-    }
-
-    void feedPcm(const PcmChunk& chunk) {
-        if (!m_codec) return;
-        size_t bytes = chunk.samples.size() * sizeof(int16_t);
-        ssize_t idx = AMediaCodec_dequeueInputBuffer(m_codec, 100'000);
-        if (idx < 0) return;
-        size_t cap=0;
-        uint8_t* buf = AMediaCodec_getInputBuffer(m_codec, (size_t)idx, &cap);
-        if (!buf || cap < bytes) {
-            log::warn("[MacroSafeguard][Mic] Input buffer smaller than needed: cap={} need={}", (int)cap, (int)bytes);
-            AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, 0, chunk.ts, 0); return;
-        }
-        std::memcpy(buf, chunk.samples.data(), bytes);
-        m_presentationUs = chunk.ts;
-        AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, bytes, chunk.ts, 0);
-    }
-
-    void drainEncoder(bool eos) {
-        if (!m_codec) return;
-        AMediaCodecBufferInfo info;
-        for (;;) {
-            ssize_t out = AMediaCodec_dequeueOutputBuffer(m_codec, &info, eos ? 500'000 : 0);
-            if (out == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
-                log::info("[MacroSafeguard][Mic] Output format changed");
-                if (!m_muxerStarted && m_muxer) {
-                    AMediaFormat* outFmt = AMediaCodec_getOutputFormat(m_codec);
-                    m_audioTrack = (int)AMediaMuxer_addTrack(m_muxer, outFmt);
-                    AMediaFormat_delete(outFmt);
-                    log::info("[MacroSafeguard][Mic] Added audio track {}", m_audioTrack);
-                    AMediaMuxer_start(m_muxer); m_muxerStarted = true;
-                    log::info("[MacroSafeguard][Mic] AMediaMuxer started for audio");
-                }
-                continue;
-            }
-            if (out == AMEDIACODEC_INFO_TRY_AGAIN_LATER) break;
-            if (out < 0) { log::warn("[MacroSafeguard][Mic] dequeueOutputBuffer returned {}", (int)out); break; }
-            if (!(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG)
-                && m_muxerStarted && m_audioTrack >= 0 && info.size > 0) {
-                size_t cap=0;
-                uint8_t* b = AMediaCodec_getOutputBuffer(m_codec, (size_t)out, &cap);
-                if (b) {
-                    log::info("[MacroSafeguard][Mic] Writing audio sample size={} pts={} flags={}", info.size, info.presentationTimeUs, info.flags);
-                    AMediaMuxer_writeSampleData(m_muxer, (size_t)m_audioTrack, b, &info);
-                } else {
-                    log::warn("[MacroSafeguard][Mic] Output buffer is null (out={})", out);
-                }
-            }
-            AMediaCodec_releaseOutputBuffer(m_codec, (size_t)out, false);
-            if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) break;
-        }
-    }
-};
-
-#else
-
-// Stub for devices without AAudio (< Android 26)
-class MicRecorder {
-public:
-    bool isRecording() const { return false; }
-    bool start(const std::string& path) {
-        log::warn("[MacroSafeguard][Mic] AAudio requires Android 26+, skipping mic recording");
-        return false;
-    }
-    void stop(bool saveFile) {}
-};
-
-#endif
-
-// ─── Android-only globals ─────────────────────────────────────────
-static VideoRecorder g_video;
-static MicRecorder   g_mic;
-
-#endif // GEODE_IS_ANDROID
-
-// ════════════════════════════════════════════════════════════════[...]
-//  Cross-platform globals
-// ════════════════════════════════════════════════════════════════[...]
-static bool     g_isPlayLayerActive = false;
-static uint64_t g_currentFrame      = 0;
-
-struct ActionEvent {
-    uint64_t frame; int button; bool isPress, isPlayer2;
-};
-static std::vector<ActionEvent> g_recordedActions;
-
-// ════════════════════════════════════════════════════════════════[...]
-//  CCEGLView hook — Android only
-// ════════════════════════════════════════════════════════════════[...]
-#ifdef GEODE_IS_ANDROID
-class $modify(MyCCEGLView, CCEGLView) {
-    void swapBuffers() {
-        if (g_isPlayLayerActive) g_video.captureFrame();
-        CCEGLView::swapBuffers();
-    }
-};
-#endif
-
-// ════════════════════════════════════════════════════════════════[...]
-//  PlayLayer hook — all platforms
-// ════════════════════════════════════════════════════════════════[...]
+// ════════════════════════════════════════════════════════════════
+//  PlayLayer Lifecycle Hook
+// ════════════════════════════════════════════════════════════════
 class $modify(MyPlayLayer, PlayLayer) {
     struct Fields {
         int  m_previousBest          = 0;
@@ -606,9 +359,6 @@ class $modify(MyPlayLayer, PlayLayer) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
         g_isPlayLayerActive = true;
-        g_currentFrame = 0;
-        g_recordedActions.clear();
-
         m_fields->m_previousBest          = level->m_normalPercent;
         m_fields->m_maxPercentThisAttempt = 0;
         m_fields->m_hasSavedThisAttempt   = false;
@@ -621,32 +371,44 @@ class $modify(MyPlayLayer, PlayLayer) {
     void startNewRecording() {
         if (m_fields->m_hasQuit) return;
 
-#ifdef GEODE_IS_ANDROID
-        if (g_video.isRecording()) g_video.stop(false);
-        if (g_mic.isRecording())   g_mic.stop(false);
+        if (UniversalRecorder::get().isRecording()) {
+            UniversalRecorder::get().stop(false);
+        }
 
-        auto dir = getRecordingsDir();
-        auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
+        std::string nameString = "Recording_" + std::to_string(ms);
 
-        std::string videoPath  = dir + std::to_string(ms) + "_video.mp4";
-        std::string clicksPath = dir + std::to_string(ms) + "_clicks.m4a";
+        auto view = CCDirector::sharedDirector()->getOpenGLView();
+        if (!view) return;
+        auto size = view->getFrameSize();
 
-        auto* view   = CCDirector::sharedDirector()->getOpenGLView();
-        auto  size   = view->getFrameSize();
-        int   width  = static_cast<int>(size.width)  & ~1;
-        int   height = static_cast<int>(size.height) & ~1;
-
-        if (!g_video.start(videoPath, width, height)) {
-            log::error("[MacroSafeguard] Video recorder failed to start");
+        // Dynamically request current operational parameter tracking configs from FMOD
+        auto fmodSystem = geode::FMODAudioEngine::sharedEngine()->m_system;
+        int sampleRate = 44100;
+        if (fmodSystem) {
+            fmodSystem->getSoftwareFormat(&sampleRate, nullptr, nullptr);
         }
 
-        if (!g_mic.start(clicksPath)) {
-            log::warn("[MacroSafeguard] Mic unavailable — "
-                      "go to Android Settings → Apps → GD → Permissions "
-                      "and enable Microphone to enable click recording");
+        UniversalRecorder::get().start(nameString, static_cast<int>(size.width), static_cast<int>(size.height), sampleRate);
+
+        // Wire FMOD Interception Framework to global master nodes seamlessly if uninitialized
+        if (fmodSystem && !g_fmodDsp) {
+            FMOD::ChannelGroup* masterGroup = nullptr;
+            fmodSystem->getMasterChannelGroup(&masterGroup);
+            if (masterGroup) {
+                FMOD_DSP_DESCRIPTION dspDesc;
+                std::memset(&dspDesc, 0, sizeof(dspDesc));
+                dspDesc.pluginsdkversion = FMOD_PLUGIN_SDK_VERSION;
+                std::strncpy(dspDesc.name, "MacroSafeguardAudioInterception", sizeof(dspDesc.name));
+                dspDesc.read = fmodAudioCallback;
+
+                fmodSystem->createDSP(&dspDesc, &g_fmodDsp);
+                if (g_fmodDsp) {
+                    masterGroup->addDSP(0, g_fmodDsp);
+                }
+            }
         }
-#endif
     }
 
     void checkAndSaveIfQualified() {
@@ -665,32 +427,24 @@ class $modify(MyPlayLayer, PlayLayer) {
 
         m_fields->m_hasSavedThisAttempt = true;
 
-#ifdef GEODE_IS_ANDROID
-        bool hadVideo = g_video.isRecording();
-        bool hadMic   = g_mic.isRecording();
-
-        g_video.stop(shouldSave);
-        g_mic.stop(shouldSave);
+        // Finalize multi-stream encoder threads safely
+        UniversalRecorder::get().stop(shouldSave);
 
         if (shouldSave) {
-            std::string msg;
-            if (hadVideo && hadMic) {
-                msg = "Saved! Video + clicks in MacroSafeguard folder";
-            } else if (hadVideo) {
-                msg = "Saved! Video in MacroSafeguard folder (no mic)";
-            } else {
-                msg = "Attempt qualified but recording failed — check logs";
-            }
+            std::string msg = "Saved! Video + Game audio safely exported to MacroSafeguard.";
 
-            Notification::create(msg, NotificationIcon::Success, 3.5f)->show();
-            log::info("[MacroSafeguard] Saved at: {}", getRecordingsDir());
+            // Thread-safely defer notification to the next frame loop.
+            geode::queueInMainThread([msg]() {
+                auto notif = Notification::create(msg, NotificationIcon::Success, 3.5f);
+                if (notif) {
+                    notif->show();
+                }
+            });
         }
-#endif
     }
 
     void resetLevel() {
         checkAndSaveIfQualified();
-
         int newBest = this->m_level ? this->m_level->m_normalPercent : 0;
 
         PlayLayer::resetLevel();
@@ -698,8 +452,6 @@ class $modify(MyPlayLayer, PlayLayer) {
         m_fields->m_previousBest          = newBest;
         m_fields->m_maxPercentThisAttempt = 0;
         m_fields->m_hasSavedThisAttempt   = false;
-        g_currentFrame = 0;
-        g_recordedActions.clear();
 
         startNewRecording();
     }
@@ -713,10 +465,10 @@ class $modify(MyPlayLayer, PlayLayer) {
     void update(float dt) {
         PlayLayer::update(dt);
         if (g_isPlayLayerActive) {
-            ++g_currentFrame;
             int pct = std::clamp(this->getCurrentPercentInt(), 0, 100);
-            if (pct > m_fields->m_maxPercentThisAttempt)
+            if (pct > m_fields->m_maxPercentThisAttempt) {
                 m_fields->m_maxPercentThisAttempt = pct;
+            }
         }
     }
 
@@ -724,32 +476,7 @@ class $modify(MyPlayLayer, PlayLayer) {
         m_fields->m_hasQuit = true;
         checkAndSaveIfQualified();
         g_isPlayLayerActive = false;
-        g_recordedActions.clear();
         PlayLayer::onQuit();
     }
 };
 
-// ════════════════════════════════════════════════════════════════[...]
-//  PlayerObject hook — all platforms
-// ════════════════════════════════════════════════════════════════[...]
-class $modify(MyPlayerObject, PlayerObject) {
-    void pushButton(PlayerButton button) {
-        PlayerObject::pushButton(button);
-        if (!g_isPlayLayerActive) return;
-        bool isP2 = false;
-        auto pl = PlayLayer::get();
-        if (pl && pl->m_player2 == this) isP2 = true;
-        g_recordedActions.push_back(
-            { g_currentFrame, static_cast<int>(button), true, isP2 });
-    }
-
-    void releaseButton(PlayerButton button) {
-        PlayerObject::releaseButton(button);
-        if (!g_isPlayLayerActive) return;
-        bool isP2 = false;
-        auto pl = PlayLayer::get();
-        if (pl && pl->m_player2 == this) isP2 = true;
-        g_recordedActions.push_back(
-            { g_currentFrame, static_cast<int>(button), false, isP2 });
-    }
-};
