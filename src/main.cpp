@@ -117,9 +117,9 @@ static void rgbaToI420(
     }
 }
 
-// ════════════════════════════════════════════════════════════════[[...]
+// ════════════════════════════════════════════════════════════════[...]
 //  VideoRecorder — H.264 video encoded to MP4
-// ════════════════════════════════════════════════════════════════[[...]
+// ════════════════════════════════════════════════���═══════════════[...]
 class VideoRecorder {
 public:
     static constexpr int TARGET_FPS = 30;
@@ -156,7 +156,7 @@ public:
             AMediaCodec_delete(m_codec); m_codec = nullptr; return false;
         }
 
-        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) {
             log::error("[MacroSafeguard][Video] Cannot open file: {}", path);
             AMediaCodec_delete(m_codec); m_codec = nullptr; return false;
@@ -164,7 +164,7 @@ public:
         m_fd    = fd;
         m_muxer = AMediaMuxer_new(fd, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
         if (!m_muxer) {
-            ::close(fd); m_fd = -1;
+            ::close(fd); m_fd = -1; ::remove(path.c_str());
             AMediaCodec_delete(m_codec); m_codec = nullptr; return false;
         }
 
@@ -291,7 +291,7 @@ private:
 
 // ════════════════════════════════════════════════════════════════[...]
 //  MicRecorder — microphone via AAudio → AAC → M4A (Android 26+ only)
-// ════════════════════════════════════════════════════════════════[...]
+// ══════════════════════════════════════════════════════════���═════[...]
 #if AAUDIO_AVAILABLE
 
 class MicRecorder {
@@ -417,7 +417,7 @@ private:
             AMediaCodec_delete(m_codec); m_codec = nullptr; return false;
         }
 
-        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) {
             log::error("[MacroSafeguard][Mic] Cannot open file: {}", path);
             AMediaCodec_delete(m_codec); m_codec = nullptr; return false;
@@ -425,7 +425,7 @@ private:
         m_fd    = fd;
         m_muxer = AMediaMuxer_new(fd, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
         if (!m_muxer) {
-            ::close(fd); m_fd=-1;
+            ::close(fd); m_fd=-1; ::remove(path.c_str());
             AMediaCodec_delete(m_codec); m_codec=nullptr; return false;
         }
 
