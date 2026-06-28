@@ -161,12 +161,15 @@ public:
             log::error("[MacroSafeguard][Video] Cannot open file: {}", path);
             AMediaCodec_delete(m_codec); m_codec = nullptr; return false;
         }
+        log::info("[MacroSafeguard][Video] Opened file descriptor {} for {}", fd, path);
         m_fd    = fd;
         m_muxer = AMediaMuxer_new(fd, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
         if (!m_muxer) {
+            log::error("[MacroSafeguard][Video] AMediaMuxer_new failed for {}", path);
             ::close(fd); m_fd = -1; ::remove(path.c_str());
             AMediaCodec_delete(m_codec); m_codec = nullptr; return false;
         }
+        log::info("[MacroSafeguard][Video] AMediaMuxer created for {}", path);
 
         AMediaCodec_start(m_codec);
         m_muxerStarted = false; m_videoTrack = -1;
@@ -255,6 +258,7 @@ private:
         size_t cap=0;
         uint8_t* buf = AMediaCodec_getInputBuffer(m_codec, (size_t)idx, &cap);
         if (!buf || (int)cap < i420Size) {
+            log::warn("[MacroSafeguard][Video] Input buffer smaller than expected: cap={} need={}", (int)cap, i420Size);
             AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, 0, f.ts, 0); return;
         }
         rgbaToI420(f.rgba.data(), m_width, m_height, buf);
@@ -268,20 +272,37 @@ private:
         for (;;) {
             ssize_t out = AMediaCodec_dequeueOutputBuffer(m_codec, &info, eos ? 500'000 : 0);
             if (out == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+                log::info("[MacroSafeguard][Video] Output format changed");
                 if (!m_muxerStarted && m_muxer) {
                     AMediaFormat* outFmt = AMediaCodec_getOutputFormat(m_codec);
                     m_videoTrack = (int)AMediaMuxer_addTrack(m_muxer, outFmt);
                     AMediaFormat_delete(outFmt);
+                    log::info("[MacroSafeguard][Video] Added video track {}", m_videoTrack);
                     AMediaMuxer_start(m_muxer); m_muxerStarted = true;
+                    log::info("[MacroSafeguard][Video] AMediaMuxer started");
                 }
                 continue;
             }
-            if (out == AMEDIACODEC_INFO_TRY_AGAIN_LATER || out < 0) break;
+            if (out == AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
+                // No output available right now
+                break;
+            }
+            if (out < 0) {
+                log::warn("[MacroSafeguard][Video] dequeueOutputBuffer returned {}", (int)out);
+                break;
+            }
             if (!(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG)
                 && m_muxerStarted && m_videoTrack >= 0 && info.size > 0) {
                 size_t cap=0;
                 uint8_t* b = AMediaCodec_getOutputBuffer(m_codec, (size_t)out, &cap);
-                if (b) AMediaMuxer_writeSampleData(m_muxer, (size_t)m_videoTrack, b, &info);
+                if (b) {
+                    log::info("[MacroSafeguard][Video] Writing sample size={} pts={} flags={}", info.size, info.presentationTimeUs, info.flags);
+                    AMediaMuxer_writeSampleData(m_muxer, (size_t)m_videoTrack, b, &info);
+                } else {
+                    log::warn("[MacroSafeguard][Video] Output buffer is null (out={})", out);
+                }
+            } else {
+                if (info.size <= 0) log::debug("[MacroSafeguard][Video] Skipping zero-size buffer (flags={})", info.flags);
             }
             AMediaCodec_releaseOutputBuffer(m_codec, (size_t)out, false);
             if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) break;
@@ -422,12 +443,15 @@ private:
             log::error("[MacroSafeguard][Mic] Cannot open file: {}", path);
             AMediaCodec_delete(m_codec); m_codec = nullptr; return false;
         }
+        log::info("[MacroSafeguard][Mic] Opened file descriptor {} for {}", fd, path);
         m_fd    = fd;
         m_muxer = AMediaMuxer_new(fd, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
         if (!m_muxer) {
+            log::error("[MacroSafeguard][Mic] AMediaMuxer_new failed for {}", path);
             ::close(fd); m_fd=-1; ::remove(path.c_str());
             AMediaCodec_delete(m_codec); m_codec=nullptr; return false;
         }
+        log::info("[MacroSafeguard][Mic] AMediaMuxer created for {}", path);
 
         AMediaCodec_start(m_codec);
         m_muxerStarted=false; m_audioTrack=-1;
@@ -479,6 +503,7 @@ private:
         size_t cap=0;
         uint8_t* buf = AMediaCodec_getInputBuffer(m_codec, (size_t)idx, &cap);
         if (!buf || cap < bytes) {
+            log::warn("[MacroSafeguard][Mic] Input buffer smaller than needed: cap={} need={}", (int)cap, (int)bytes);
             AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, 0, chunk.ts, 0); return;
         }
         std::memcpy(buf, chunk.samples.data(), bytes);
@@ -492,20 +517,29 @@ private:
         for (;;) {
             ssize_t out = AMediaCodec_dequeueOutputBuffer(m_codec, &info, eos ? 500'000 : 0);
             if (out == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+                log::info("[MacroSafeguard][Mic] Output format changed");
                 if (!m_muxerStarted && m_muxer) {
                     AMediaFormat* outFmt = AMediaCodec_getOutputFormat(m_codec);
                     m_audioTrack = (int)AMediaMuxer_addTrack(m_muxer, outFmt);
                     AMediaFormat_delete(outFmt);
+                    log::info("[MacroSafeguard][Mic] Added audio track {}", m_audioTrack);
                     AMediaMuxer_start(m_muxer); m_muxerStarted = true;
+                    log::info("[MacroSafeguard][Mic] AMediaMuxer started for audio");
                 }
                 continue;
             }
-            if (out == AMEDIACODEC_INFO_TRY_AGAIN_LATER || out < 0) break;
+            if (out == AMEDIACODEC_INFO_TRY_AGAIN_LATER) break;
+            if (out < 0) { log::warn("[MacroSafeguard][Mic] dequeueOutputBuffer returned {}", (int)out); break; }
             if (!(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG)
                 && m_muxerStarted && m_audioTrack >= 0 && info.size > 0) {
                 size_t cap=0;
                 uint8_t* b = AMediaCodec_getOutputBuffer(m_codec, (size_t)out, &cap);
-                if (b) AMediaMuxer_writeSampleData(m_muxer, (size_t)m_audioTrack, b, &info);
+                if (b) {
+                    log::info("[MacroSafeguard][Mic] Writing audio sample size={} pts={} flags={}", info.size, info.presentationTimeUs, info.flags);
+                    AMediaMuxer_writeSampleData(m_muxer, (size_t)m_audioTrack, b, &info);
+                } else {
+                    log::warn("[MacroSafeguard][Mic] Output buffer is null (out={})", out);
+                }
             }
             AMediaCodec_releaseOutputBuffer(m_codec, (size_t)out, false);
             if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) break;
