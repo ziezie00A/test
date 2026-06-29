@@ -4,11 +4,11 @@ project(MacroSafeguard)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+add_library(${PROJECT_NAME} SHARED src/main.cpp)
+
+# Applying this target-wide fixes the Precompiled Header dialect mismatch
 if (APPLE)
-    add_library(${PROJECT_NAME} SHARED src/main.cpp)
-    set_source_files_properties(src/main.cpp PROPERTIES COMPILE_FLAGS "-x objective-c++")
-else()
-    add_library(${PROJECT_NAME} SHARED src/main.cpp)
+    target_compile_options(${PROJECT_NAME} PRIVATE "-x" "objective-c++")
 endif()
 
 if (NOT DEFINED ENV{GEODE_SDK})

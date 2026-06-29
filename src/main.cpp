@@ -31,7 +31,7 @@
     #pragma comment(lib, "mfuuid.lib")
     #pragma comment(lib, "mfreadwrite.lib")
     #pragma comment(lib, "Ole32.lib")
-#elif defined(GEODE_IS_MACOS)
+#elif defined(__APPLE__)
     #import <AVFoundation/AVFoundation.h>
     #import <CoreMedia/CoreMedia.h>
     #import <CoreVideo/CoreVideo.h>
@@ -62,7 +62,7 @@ static std::string getRecordingsDir() {
 #elif defined(GEODE_IS_WINDOWS)
     const char* appdata = getenv("APPDATA");
     dir = appdata ? (std::string(appdata) + "\\MacroSafeguard\\") : ".\\MacroSafeguard\\";
-#elif defined(GEODE_IS_MACOS)
+#elif defined(__APPLE__)
     const char* home = getenv("HOME");
     dir = home ? (std::string(home) + "/Library/Application Support/MacroSafeguard/") : "/tmp/MacroSafeguard/";
 #else
@@ -193,7 +193,7 @@ public:
 
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
-            if (m_frameQueue.size() < 60) { // Bound queue capacity to avoid out-of-memory issues
+            if (m_frameQueue.size() < 60) {
                 m_frameQueue.push(std::move(pixels));
             }
         }
@@ -215,10 +215,10 @@ static WindowsRecorder g_winRecorder;
 #endif
 
 // ════════════════════════════════════════════════════════════════
-//  MACOS BACKEND: Asynchronous AVFoundation Engine
+//  APPLE BACKEND (macOS & iOS): Asynchronous AVFoundation Engine
 // ════════════════════════════════════════════════════════════════
-#if defined(GEODE_IS_MACOS)
-class MacosRecorder {
+#if defined(__APPLE__)
+class AppleRecorder {
 private:
     std::atomic<bool> m_recording{false};
     std::thread m_workerThread;
@@ -268,11 +268,7 @@ private:
             }
 
             [m_writerInput markAsFinished];
-            [m_assetWriter finishWritingWithCompletionHandler:^{
-                if (!m_recording && !m_path.empty()) {
-                    // Safe post-processing verification spot
-                }
-            }];
+            [m_assetWriter finishWritingWithCompletionHandler:^{}];
         }
     }
 
@@ -298,8 +294,9 @@ public:
             m_writerInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:outputSettings];
             m_writerInput.expectsMediaDataInRealTime = YES;
 
+            // Shifted to RGBA to accommodate iOS OpenGL ES expectations safely
             NSDictionary* attributes = @{
-                (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+                (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32RGBA),
                 (id)kCVPixelBufferWidthKey: @(width),
                 (id)kCVPixelBufferHeightKey: @(height)
             };
@@ -312,7 +309,7 @@ public:
         }
         
         m_recording = true;
-        m_workerThread = std::thread(&MacosRecorder::encodeLoop, this);
+        m_workerThread = std::thread(&AppleRecorder::encodeLoop, this);
         return true;
     }
 
@@ -320,7 +317,7 @@ public:
         if (!m_recording) return;
         std::vector<uint8_t> pixels(m_width * m_height * 4);
         glPixelStorei(GL_PACK_ALIGNMENT, 4);
-        glReadPixels(0, 0, m_width, m_height, GL_BGRA, GL_UNSIGNED_BYTE, pixels.data());
+        glReadPixels(0, 0, m_width, m_height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
 
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
@@ -342,7 +339,7 @@ public:
 
     bool isRecording() const { return m_recording.load(); }
 };
-static MacosRecorder g_macRecorder;
+static AppleRecorder g_appleRecorder;
 #endif
 
 // ════════════════════════════════════════════════════════════════
@@ -479,7 +476,6 @@ private:
     static aaudio_data_callback_result_t dataCallback(AAudioStream*, void* ud, void* audio, int32_t nFrames) {
         auto* self = static_cast<MicRecorder*>(ud);
         if (!self->m_recording.load()) return AAUDIO_CALLBACK_RESULT_STOP;
-        // Audio buffers pass seamlessly here for localized device ingestions
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
 
@@ -548,7 +544,7 @@ static void saveClicksCSV(const std::vector<ActionEvent>& actions, bool saveFile
 }
 
 // ════════════════════════════════════════════════════════════════
-//  GEODE HOOKS (System Ingests Pipeline execution)
+//  GEODE HOOKS
 // ════════════════════════════════════════════════════════════════
 
 class $modify(MyCCEGLView, CCEGLView) {
@@ -556,8 +552,8 @@ class $modify(MyCCEGLView, CCEGLView) {
         if (g_isPlayLayerActive) {
 #if defined(GEODE_IS_WINDOWS)
             g_winRecorder.captureFrame();
-#elif defined(GEODE_IS_MACOS)
-            g_macRecorder.captureFrame();
+#elif defined(__APPLE__)
+            g_appleRecorder.captureFrame();
 #elif defined(GEODE_IS_ANDROID)
             g_androidRecorder.captureFrame();
 #endif
@@ -600,13 +596,13 @@ class $modify(MyPlayLayer, PlayLayer) {
 
         auto* view = CCDirector::sharedDirector()->getOpenGLView();
         auto size = view->getFrameSize();
-        int width = static_cast<int>(size.width) & ~3;   // Force strictly clean 4-byte byte widths safely
+        int width = static_cast<int>(size.width) & ~3;
         int height = static_cast<int>(size.height) & ~3;
 
 #if defined(GEODE_IS_WINDOWS)
         g_winRecorder.start(m_fields->m_currentRecordingPath, width, height);
-#elif defined(GEODE_IS_MACOS)
-        g_macRecorder.start(m_fields->m_currentRecordingPath, width, height);
+#elif defined(__APPLE__)
+        g_appleRecorder.start(m_fields->m_currentRecordingPath, width, height);
 #elif defined(GEODE_IS_ANDROID)
         g_androidRecorder.start(m_fields->m_currentRecordingPath, width, height);
         g_micRecorder.start(m_fields->m_audioRecordingPath);
@@ -628,8 +624,8 @@ class $modify(MyPlayLayer, PlayLayer) {
 
 #if defined(GEODE_IS_WINDOWS)
         g_winRecorder.stop(shouldSave);
-#elif defined(GEODE_IS_MACOS)
-        g_macRecorder.stop(shouldSave);
+#elif defined(__APPLE__)
+        g_appleRecorder.stop(shouldSave);
 #elif defined(GEODE_IS_ANDROID)
         g_androidRecorder.stop(shouldSave);
         g_micRecorder.stop(shouldSave);
