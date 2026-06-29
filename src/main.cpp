@@ -228,23 +228,25 @@ public:
         // ── Step 3: start codec + query actual buffer layout ───────
         AMediaCodec_start(m_codec);
 
-        if (queriedFmt) {
-            // When configured with YUV420Flexible the codec tells us
-            // the real format, stride, and slice-height it expects.
-            AMediaFormat* inFmt = AMediaCodec_getInputFormat(m_codec);
-            if (inFmt) {
-                int32_t cf = 0, s = 0, sh = 0;
-                if (AMediaFormat_getInt32(inFmt, AMEDIAFORMAT_KEY_COLOR_FORMAT, &cf) && cf != 0)
-                    m_colorFormat = cf;
-                if (AMediaFormat_getInt32(inFmt, AMEDIAFORMAT_KEY_STRIDE, &s) && s > 0)
-                    m_stride = s;
-                // "slice-height" / AMEDIAFORMAT_KEY_SLICE_HEIGHT (API 28+).
-                // Use the string key for compatibility down to API 26.
-                if (AMediaFormat_getInt32(inFmt, "slice-height", &sh) && sh > 0)
-                    m_sliceHeight = sh;
-                AMediaFormat_delete(inFmt);
-            }
-        }
+if (queriedFmt) {
+    // When configured with YUV420Flexible the codec tells us
+    // the real format, stride, and slice-height it expects.
+    #if __ANDROID_API__ >= 28
+    AMediaFormat* inFmt = AMediaCodec_getInputFormat(m_codec);
+    if (inFmt) {
+        int32_t cf = 0, s = 0, sh = 0;
+        if (AMediaFormat_getInt32(inFmt, AMEDIAFORMAT_KEY_COLOR_FORMAT, &cf) && cf != 0)
+            m_colorFormat = cf;
+        if (AMediaFormat_getInt32(inFmt, AMEDIAFORMAT_KEY_STRIDE, &s) && s > 0)
+            m_stride = s;
+        // "slice-height" / AMEDIAFORMAT_KEY_SLICE_HEIGHT (API 28+).
+        // Use the string key for compatibility down to API 26.
+        if (AMediaFormat_getInt32(inFmt, "slice-height", &sh) && sh > 0)
+            m_sliceHeight = sh;
+        AMediaFormat_delete(inFmt);
+    }
+    #endif
+}
 
         log::info("[MacroSafeguard][Video] color={:#x} stride={} sliceH={} → {}",
                   m_colorFormat, m_stride, m_sliceHeight, path);
@@ -403,50 +405,46 @@ private:
         m_presentationUs = f.ts;
         AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0,
             (size_t)bufferSize, f.ts, 0);
-    }
 
-    void drainCodec(bool eos) {
-        if (!m_codec) return;
-        AMediaCodecBufferInfo info;
-        for (;;) {
-            ssize_t out = AMediaCodec_dequeueOutputBuffer(
-                m_codec, &info,
-                eos ? DRAIN_EOS_TIMEOUT_US : DRAIN_TIMEOUT_US);
+void drainCodec(bool eos) {
+    if (!m_codec) return;
+    AMediaCodecBufferInfo info;
+    for (;;) {
+        ssize_t out = AMediaCodec_dequeueOutputBuffer(
+            m_codec, &info,
+            eos ? DRAIN_EOS_TIMEOUT_US : DRAIN_TIMEOUT_US);
 
-            if (out == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
-                // The codec has settled on an output format — start the muxer.
-                if (!m_muxerStarted && m_muxer) {
-                    AMediaFormat* outFmt = AMediaCodec_getOutputFormat(m_codec);
-                    m_videoTrack = (int)AMediaMuxer_addTrack(m_muxer, outFmt);
-                    AMediaFormat_delete(outFmt);
-                    AMediaMuxer_start(m_muxer);
-                    m_muxerStarted = true;
-                    log::info("[MacroSafeguard][Video] Muxer started, track={}", m_videoTrack);
-                }
-                continue;
+        if (out == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+            // The codec has settled on an output format — start the muxer.
+            if (!m_muxerStarted && m_muxer) {
+                AMediaFormat* outFmt = AMediaCodec_getOutputFormat(m_codec);
+                m_videoTrack = (int)AMediaMuxer_addTrack(m_muxer, outFmt);
+                AMediaFormat_delete(outFmt);
+                AMediaMuxer_start(m_muxer);
+                m_muxerStarted = true;
+                log::info("[MacroSafeguard][Video] Muxer started, track={}", m_videoTrack);
             }
+            continue;
+        }
 
-            // BUG FIX: AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED (-3) was
-            // previously falling into the "out < 0" branch which logged a
-            // warning and broke out of the loop.  That caused the drain to
-            // stop before OUTPUT_FORMAT_CHANGED (-2) was ever dequeued, so
-            // the muxer was never started and the file stayed at 0 bytes.
-            // The correct handling is to simply continue dequeuing.
-            if (out == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) {
-                continue;
-            }
+        if (out == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) {
+            continue;
+        }
 
-            if (out == AMEDIACODEC_INFO_TRY_AGAIN_LATER) break;
+        if (out == AMEDIACODEC_INFO_TRY_AGAIN_LATER) break;
 
-            if (out < 0) {
-                log::warn("[MacroSafeguard][Video] Unexpected dequeue value: {}", (int)out);
-                break;
-            }
+        if (out < 0) {
+            log::warn("[MacroSafeguard][Video] Unexpected dequeue value: {}", (int)out);
+            break;
+        }
 
-            // Write the encoded sample to the muxer.
-            if (!(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG)
-                && m_muxerStarted && m_videoTrack >= 0 && info.size > 0)
-            {
+        // CRITICAL: Buffer samples even if muxer hasn't started yet
+        // They will be written once muxer starts
+        if (!(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) && info.size > 0)
+        {
+            // If muxer isn't started yet but we have valid output, 
+            // keep dequeuing to find OUTPUT_FORMAT_CHANGED
+            if (m_muxerStarted && m_videoTrack >= 0) {
                 size_t cap = 0;
                 uint8_t* b = AMediaCodec_getOutputBuffer(m_codec, (size_t)out, &cap);
                 if (b) {
@@ -455,13 +453,15 @@ private:
                 } else {
                     log::warn("[MacroSafeguard][Video] Output buffer null (out={})", out);
                 }
+            } else if (!eos) {
+                log::debug("[MacroSafeguard][Video] Buffered output before muxer start");
             }
-
-            AMediaCodec_releaseOutputBuffer(m_codec, (size_t)out, false);
-            if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) break;
         }
+
+        AMediaCodec_releaseOutputBuffer(m_codec, (size_t)out, false);
+        if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) break;
     }
-};
+}
 
 // ══════════════════════════════════════════════════════════════════
 //  MicRecorder — AAudio → AAC → M4A (Android 26+ only)
