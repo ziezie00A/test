@@ -40,9 +40,9 @@
 
 using namespace geode::prelude;
 
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  Recordings directory (platform-specific, null-safe)
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 static std::string getRecordingsDir() {
     std::string dir;
 #ifdef GEODE_IS_ANDROID
@@ -67,9 +67,9 @@ static std::string getRecordingsDir() {
     return dir;
 }
 
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  Android-only: video + audio recording
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 #ifdef GEODE_IS_ANDROID
 
 // ─── RGBA → NV12 (YUV420SemiPlanar) with codec stride support ─────
@@ -152,9 +152,9 @@ static void rgbaToI420(
     }
 }
 
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  VideoRecorder
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 class VideoRecorder {
 public:
     static constexpr int     TARGET_FPS           = 30;
@@ -363,110 +363,111 @@ private:
         }
     }
 
-void feedFrame(const Frame& f) {
-    if (!m_codec) return;
+    void feedFrame(const Frame& f) {
+        if (!m_codec) return;
 
-    // Buffer size uses the actual stride × sliceHeight the codec
-    // reported, NOT just width × height.  On many devices these
-    // differ (e.g. width=1080 but stride=1088), and writing with
-    // the wrong stride corrupts every row so the codec drops input.
-    int bufferSize = m_stride * m_sliceHeight * 3 / 2;
+        // Buffer size uses the actual stride × sliceHeight the codec
+        // reported, NOT just width × height.  On many devices these
+        // differ (e.g. width=1080 but stride=1088), and writing with
+        // the wrong stride corrupts every row so the codec drops input.
+        int bufferSize = m_stride * m_sliceHeight * 3 / 2;
 
-    ssize_t idx = AMediaCodec_dequeueInputBuffer(m_codec, 100'000);
-    if (idx < 0) {
-        log::warn("[MacroSafeguard][Video] dequeueInputBuffer returned {}", (int)idx);
-        return;
-    }
-    size_t cap = 0;
-    uint8_t* buf = AMediaCodec_getInputBuffer(m_codec, (size_t)idx, &cap);
-    if (!buf) {
-        log::warn("[MacroSafeguard][Video] getInputBuffer returned null");
-        AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, 0, f.ts, 0);
-        return;
-    }
-    if ((int)cap < bufferSize) {
-        log::warn("[MacroSafeguard][Video] Buffer cap={} < need={}", (int)cap, bufferSize);
-        AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, 0, f.ts, 0);
-        return;
-    }
-
-    // Zero-fill the whole buffer first so stride padding bytes are
-    // well-defined (avoids undefined behaviour in the codec).
-    memset(buf, 0, (size_t)bufferSize);
-
-    // Convert based on the actual colour format the codec reported.
-    if (m_colorFormat == COLOR_I420) {
-        rgbaToI420(f.rgba.data(), m_width, m_height, m_stride, m_sliceHeight, buf);
-    } else {
-        // Treat everything else as NV12 (the overwhelmingly common case).
-        rgbaToNV12(f.rgba.data(), m_width, m_height, m_stride, m_sliceHeight, buf);
-    }
-
-    m_presentationUs = f.ts;
-    AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0,
-        (size_t)bufferSize, f.ts, 0);
-}
-
-void drainCodec(bool eos) {
-    if (!m_codec) return;
-    AMediaCodecBufferInfo info;
-    for (;;) {
-        ssize_t out = AMediaCodec_dequeueOutputBuffer(
-            m_codec, &info,
-            eos ? DRAIN_EOS_TIMEOUT_US : DRAIN_TIMEOUT_US);
-
-        if (out == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
-            // The codec has settled on an output format — start the muxer.
-            if (!m_muxerStarted && m_muxer) {
-                AMediaFormat* outFmt = AMediaCodec_getOutputFormat(m_codec);
-                m_videoTrack = (int)AMediaMuxer_addTrack(m_muxer, outFmt);
-                AMediaFormat_delete(outFmt);
-                AMediaMuxer_start(m_muxer);
-                m_muxerStarted = true;
-                log::info("[MacroSafeguard][Video] Muxer started, track={}", m_videoTrack);
-            }
-            continue;
+        ssize_t idx = AMediaCodec_dequeueInputBuffer(m_codec, 100'000);
+        if (idx < 0) {
+            log::warn("[MacroSafeguard][Video] dequeueInputBuffer returned {}", (int)idx);
+            return;
+        }
+        size_t cap = 0;
+        uint8_t* buf = AMediaCodec_getInputBuffer(m_codec, (size_t)idx, &cap);
+        if (!buf) {
+            log::warn("[MacroSafeguard][Video] getInputBuffer returned null");
+            AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, 0, f.ts, 0);
+            return;
+        }
+        if ((int)cap < bufferSize) {
+            log::warn("[MacroSafeguard][Video] Buffer cap={} < need={}", (int)cap, bufferSize);
+            AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, 0, f.ts, 0);
+            return;
         }
 
-        if (out == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) {
-            continue;
+        // Zero-fill the whole buffer first so stride padding bytes are
+        // well-defined (avoids undefined behaviour in the codec).
+        memset(buf, 0, (size_t)bufferSize);
+
+        // Convert based on the actual colour format the codec reported.
+        if (m_colorFormat == COLOR_I420) {
+            rgbaToI420(f.rgba.data(), m_width, m_height, m_stride, m_sliceHeight, buf);
+        } else {
+            // Treat everything else as NV12 (the overwhelmingly common case).
+            rgbaToNV12(f.rgba.data(), m_width, m_height, m_stride, m_sliceHeight, buf);
         }
 
-        if (out == AMEDIACODEC_INFO_TRY_AGAIN_LATER) break;
+        m_presentationUs = f.ts;
+        AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0,
+            (size_t)bufferSize, f.ts, 0);
+    }
 
-        if (out < 0) {
-            log::warn("[MacroSafeguard][Video] Unexpected dequeue value: {}", (int)out);
-            break;
-        }
+    void drainCodec(bool eos) {
+        if (!m_codec) return;
+        AMediaCodecBufferInfo info;
+        for (;;) {
+            ssize_t out = AMediaCodec_dequeueOutputBuffer(
+                m_codec, &info,
+                eos ? DRAIN_EOS_TIMEOUT_US : DRAIN_TIMEOUT_US);
 
-        // CRITICAL: Buffer samples even if muxer hasn't started yet
-        // They will be written once muxer starts
-        if (!(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) && info.size > 0)
-        {
-            // If muxer isn't started yet but we have valid output, 
-            // keep dequeuing to find OUTPUT_FORMAT_CHANGED
-            if (m_muxerStarted && m_videoTrack >= 0) {
-                size_t cap = 0;
-                uint8_t* b = AMediaCodec_getOutputBuffer(m_codec, (size_t)out, &cap);
-                if (b) {
-                    AMediaMuxer_writeSampleData(
-                        m_muxer, (size_t)m_videoTrack, b, &info);
-                } else {
-                    log::warn("[MacroSafeguard][Video] Output buffer null (out={})", out);
+            if (out == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+                // The codec has settled on an output format — start the muxer.
+                if (!m_muxerStarted && m_muxer) {
+                    AMediaFormat* outFmt = AMediaCodec_getOutputFormat(m_codec);
+                    m_videoTrack = (int)AMediaMuxer_addTrack(m_muxer, outFmt);
+                    AMediaFormat_delete(outFmt);
+                    AMediaMuxer_start(m_muxer);
+                    m_muxerStarted = true;
+                    log::info("[MacroSafeguard][Video] Muxer started, track={}", m_videoTrack);
                 }
-            } else if (!eos) {
-                log::debug("[MacroSafeguard][Video] Buffered output before muxer start");
+                continue;
             }
+
+            if (out == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) {
+                continue;
+            }
+
+            if (out == AMEDIACODEC_INFO_TRY_AGAIN_LATER) break;
+
+            if (out < 0) {
+                log::warn("[MacroSafeguard][Video] Unexpected dequeue value: {}", (int)out);
+                break;
+            }
+
+            // CRITICAL: Buffer samples even if muxer hasn't started yet
+            // They will be written once muxer starts
+            if (!(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) && info.size > 0)
+            {
+                // If muxer isn't started yet but we have valid output, 
+                // keep dequeuing to find OUTPUT_FORMAT_CHANGED
+                if (m_muxerStarted && m_videoTrack >= 0) {
+                    size_t cap = 0;
+                    uint8_t* b = AMediaCodec_getOutputBuffer(m_codec, (size_t)out, &cap);
+                    if (b) {
+                        AMediaMuxer_writeSampleData(
+                            m_muxer, (size_t)m_videoTrack, b, &info);
+                    } else {
+                        log::warn("[MacroSafeguard][Video] Output buffer null (out={})", out);
+                    }
+                } else if (!eos) {
+                    log::debug("[MacroSafeguard][Video] Buffered output before muxer start");
+                }
+            }
+
+            AMediaCodec_releaseOutputBuffer(m_codec, (size_t)out, false);
+            if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) break;
         }
-
-        AMediaCodec_releaseOutputBuffer(m_codec, (size_t)out, false);
-        if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) break;
     }
-}
+};
 
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  MicRecorder — AAudio → AAC → M4A (Android 26+ only)
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 #if AAUDIO_AVAILABLE
 
 class MicRecorder {
@@ -732,18 +733,18 @@ static MicRecorder   g_mic;
 
 #endif  // GEODE_IS_ANDROID
 
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  Cross-platform globals
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 static bool     g_isPlayLayerActive = false;
 static uint64_t g_currentFrame      = 0;
 
 struct ActionEvent { uint64_t frame; int button; bool isPress, isPlayer2; };
 static std::vector<ActionEvent> g_recordedActions;
 
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  Cross-platform: save click data as CSV (non-Android platforms)
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 static void saveClicksCSV(const std::vector<ActionEvent>& actions, bool saveFile) {
     if (!saveFile || actions.empty()) return;
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -758,9 +759,9 @@ static void saveClicksCSV(const std::vector<ActionEvent>& actions, bool saveFile
     log::info("[MacroSafeguard] Clicks CSV → {}", path);
 }
 
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  CCEGLView hook — frame capture, Android only
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 #ifdef GEODE_IS_ANDROID
 class $modify(MyCCEGLView, CCEGLView) {
     void swapBuffers() {
@@ -770,9 +771,9 @@ class $modify(MyCCEGLView, CCEGLView) {
 };
 #endif
 
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  PlayLayer hook — all platforms
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 class $modify(MyPlayLayer, PlayLayer) {
     struct Fields {
         int  m_previousBest          = 0;
@@ -894,9 +895,9 @@ class $modify(MyPlayLayer, PlayLayer) {
     }
 };
 
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 //  PlayerObject hook — all platforms
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════[...]
 class $modify(MyPlayerObject, PlayerObject) {
     void pushButton(PlayerButton button) {
         PlayerObject::pushButton(button);
@@ -913,4 +914,3 @@ class $modify(MyPlayerObject, PlayerObject) {
         g_recordedActions.push_back({ g_currentFrame, (int)button, false, isP2 });
     }
 };
-
