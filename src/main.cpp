@@ -363,48 +363,49 @@ private:
         }
     }
 
-    void feedFrame(const Frame& f) {
-        if (!m_codec) return;
+void feedFrame(const Frame& f) {
+    if (!m_codec) return;
 
-        // Buffer size uses the actual stride × sliceHeight the codec
-        // reported, NOT just width × height.  On many devices these
-        // differ (e.g. width=1080 but stride=1088), and writing with
-        // the wrong stride corrupts every row so the codec drops input.
-        int bufferSize = m_stride * m_sliceHeight * 3 / 2;
+    // Buffer size uses the actual stride × sliceHeight the codec
+    // reported, NOT just width × height.  On many devices these
+    // differ (e.g. width=1080 but stride=1088), and writing with
+    // the wrong stride corrupts every row so the codec drops input.
+    int bufferSize = m_stride * m_sliceHeight * 3 / 2;
 
-        ssize_t idx = AMediaCodec_dequeueInputBuffer(m_codec, 100'000);
-        if (idx < 0) {
-            log::warn("[MacroSafeguard][Video] dequeueInputBuffer returned {}", (int)idx);
-            return;
-        }
-        size_t cap = 0;
-        uint8_t* buf = AMediaCodec_getInputBuffer(m_codec, (size_t)idx, &cap);
-        if (!buf) {
-            log::warn("[MacroSafeguard][Video] getInputBuffer returned null");
-            AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, 0, f.ts, 0);
-            return;
-        }
-        if ((int)cap < bufferSize) {
-            log::warn("[MacroSafeguard][Video] Buffer cap={} < need={}", (int)cap, bufferSize);
-            AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, 0, f.ts, 0);
-            return;
-        }
+    ssize_t idx = AMediaCodec_dequeueInputBuffer(m_codec, 100'000);
+    if (idx < 0) {
+        log::warn("[MacroSafeguard][Video] dequeueInputBuffer returned {}", (int)idx);
+        return;
+    }
+    size_t cap = 0;
+    uint8_t* buf = AMediaCodec_getInputBuffer(m_codec, (size_t)idx, &cap);
+    if (!buf) {
+        log::warn("[MacroSafeguard][Video] getInputBuffer returned null");
+        AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, 0, f.ts, 0);
+        return;
+    }
+    if ((int)cap < bufferSize) {
+        log::warn("[MacroSafeguard][Video] Buffer cap={} < need={}", (int)cap, bufferSize);
+        AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0, 0, f.ts, 0);
+        return;
+    }
 
-        // Zero-fill the whole buffer first so stride padding bytes are
-        // well-defined (avoids undefined behaviour in the codec).
-        memset(buf, 0, (size_t)bufferSize);
+    // Zero-fill the whole buffer first so stride padding bytes are
+    // well-defined (avoids undefined behaviour in the codec).
+    memset(buf, 0, (size_t)bufferSize);
 
-        // Convert based on the actual colour format the codec reported.
-        if (m_colorFormat == COLOR_I420) {
-            rgbaToI420(f.rgba.data(), m_width, m_height, m_stride, m_sliceHeight, buf);
-        } else {
-            // Treat everything else as NV12 (the overwhelmingly common case).
-            rgbaToNV12(f.rgba.data(), m_width, m_height, m_stride, m_sliceHeight, buf);
-        }
+    // Convert based on the actual colour format the codec reported.
+    if (m_colorFormat == COLOR_I420) {
+        rgbaToI420(f.rgba.data(), m_width, m_height, m_stride, m_sliceHeight, buf);
+    } else {
+        // Treat everything else as NV12 (the overwhelmingly common case).
+        rgbaToNV12(f.rgba.data(), m_width, m_height, m_stride, m_sliceHeight, buf);
+    }
 
-        m_presentationUs = f.ts;
-        AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0,
-            (size_t)bufferSize, f.ts, 0);
+    m_presentationUs = f.ts;
+    AMediaCodec_queueInputBuffer(m_codec, (size_t)idx, 0,
+        (size_t)bufferSize, f.ts, 0);
+}
 
 void drainCodec(bool eos) {
     if (!m_codec) return;
