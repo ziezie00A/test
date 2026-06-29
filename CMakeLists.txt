@@ -6,9 +6,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_library(${PROJECT_NAME} SHARED src/main.cpp)
 
-# Applying this target-wide fixes the Precompiled Header dialect mismatch
 if (APPLE)
-    target_compile_options(${PROJECT_NAME} PRIVATE "-x" "objective-c++")
+    # 1. Kill the PCH dialect mismatch error by bypassing PCH generation entirely
+    set_target_properties(${PROJECT_NAME} PROPERTIES DISABLE_PRECOMPILED_HEADERS ON)
+    
+    # 2. Force treat main.cpp as Objective-C++ so AVFoundation compiles smoothly
+    set_source_files_properties(src/main.cpp PROPERTIES COMPILE_FLAGS "-x objective-c++")
 endif()
 
 if (NOT DEFINED ENV{GEODE_SDK})
