@@ -32,15 +32,18 @@
     #pragma comment(lib, "mfreadwrite.lib")
     #pragma comment(lib, "Ole32.lib")
 #elif defined(__APPLE__)
-    // Drop Geode's compiler macro token renaming mapping so Apple SDKs can use 'CommentType' safely
+    // 1. Clear any existing command-line macro definitions for CommentType
     #undef CommentType
+
+    // 2. Force Apple's headers to define their type under a harmless dummy name
+    #define CommentType AppleCommentType
 
     #import <AVFoundation/AVFoundation.h>
     #import <CoreMedia/CoreMedia.h>
     #import <CoreVideo/CoreVideo.h>
 
-    // Restore Geode's internal mapping so its structural bindings link cleanly downstream
-    #define CommentType CommentTypeDummy
+    // 3. Clear our redirection macro so it doesn't pollute your actual code downstream
+    #undef CommentType
 #elif defined(GEODE_IS_ANDROID)
     #include <media/NdkMediaCodec.h>
     #include <media/NdkMediaMuxer.h>
@@ -62,14 +65,12 @@ using namespace geode::prelude;
 //  Cross-Platform Sandbox-Safe Path Resolver
 // ════════════════════════════════════════════════════════════════
 static std::string getRecordingsDir() {
-    // Dynamically query Geode's platform-agnostic storage directory
     auto saveDir = geode::Mod::get()->getSaveDir();
     auto recordingsDir = saveDir / "Recordings";
     
     std::error_code ec;
     std::filesystem::create_directories(recordingsDir, ec);
     
-    // Append a proper trailing delimiter to guarantee safe standard string concatenations
     std::string dirStr = recordingsDir.string();
     if (!dirStr.empty() && dirStr.back() != '/' && dirStr.back() != '\\') {
 #if defined(GEODE_IS_WINDOWS)
@@ -302,7 +303,6 @@ public:
             m_writerInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:outputSettings];
             m_writerInput.expectsMediaDataInRealTime = YES;
 
-            // Shifted to RGBA to accommodate iOS OpenGL ES expectations safely
             NSDictionary* attributes = @{
                 (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32RGBA),
                 (id)kCVPixelBufferWidthKey: @(width),
