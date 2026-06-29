@@ -4,13 +4,12 @@ project(MacroSafeguard)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+set(GEODE_DISABLE_PRECOMPILED_HEADERS ON CACHE BOOL "Disable PCH globally" FORCE)
+
 add_library(${PROJECT_NAME} SHARED src/main.cpp)
 
 if (APPLE)
-    # 1. Kill the PCH dialect mismatch error by bypassing PCH generation entirely
-    set_target_properties(${PROJECT_NAME} PROPERTIES DISABLE_PRECOMPILED_HEADERS ON)
-    
-    # 2. Force treat main.cpp as Objective-C++ so AVFoundation compiles smoothly
+    # Force treat main.cpp as Objective-C++ so AVFoundation code compiles smoothly
     set_source_files_properties(src/main.cpp PROPERTIES COMPILE_FLAGS "-x objective-c++")
 endif()
 
