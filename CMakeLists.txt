@@ -25,7 +25,7 @@ if (ANDROID)
         android
         log
     )
-elif (WIN32)
+elseif (WIN32)
     target_link_libraries(${PROJECT_NAME} 
         geode-sdk
         mfplat
@@ -33,7 +33,7 @@ elif (WIN32)
         mfreadwrite
         ole32
     )
-elif (APPLE)
+elseif (APPLE)
     find_library(AVFOUNDATION_RAW AVFoundation)
     find_library(COREMEDIA_RAW CoreMedia)
     find_library(COREVIDEO_RAW CoreVideo)
