@@ -32,9 +32,15 @@
     #pragma comment(lib, "mfreadwrite.lib")
     #pragma comment(lib, "Ole32.lib")
 #elif defined(__APPLE__)
+    // Drop Geode's compiler macro token renaming mapping so Apple SDKs can use 'CommentType' safely
+    #undef CommentType
+
     #import <AVFoundation/AVFoundation.h>
     #import <CoreMedia/CoreMedia.h>
     #import <CoreVideo/CoreVideo.h>
+
+    // Restore Geode's internal mapping so its structural bindings link cleanly downstream
+    #define CommentType CommentTypeDummy
 #elif defined(GEODE_IS_ANDROID)
     #include <media/NdkMediaCodec.h>
     #include <media/NdkMediaMuxer.h>
@@ -53,24 +59,26 @@
 using namespace geode::prelude;
 
 // ════════════════════════════════════════════════════════════════
-//  Cross-Platform Path Resolver
+//  Cross-Platform Sandbox-Safe Path Resolver
 // ════════════════════════════════════════════════════════════════
 static std::string getRecordingsDir() {
-    std::string dir;
-#if defined(GEODE_IS_ANDROID)
-    dir = "/storage/emulated/0/MacroSafeguard/";
-#elif defined(GEODE_IS_WINDOWS)
-    const char* appdata = getenv("APPDATA");
-    dir = appdata ? (std::string(appdata) + "\\MacroSafeguard\\") : ".\\MacroSafeguard\\";
-#elif defined(__APPLE__)
-    const char* home = getenv("HOME");
-    dir = home ? (std::string(home) + "/Library/Application Support/MacroSafeguard/") : "/tmp/MacroSafeguard/";
-#else
-    dir = "./MacroSafeguard/";
-#endif
+    // Dynamically query Geode's platform-agnostic storage directory
+    auto saveDir = geode::Mod::get()->getSaveDir();
+    auto recordingsDir = saveDir / "Recordings";
+    
     std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    std::filesystem::create_directories(recordingsDir, ec);
+    
+    // Append a proper trailing delimiter to guarantee safe standard string concatenations
+    std::string dirStr = recordingsDir.string();
+    if (!dirStr.empty() && dirStr.back() != '/' && dirStr.back() != '\\') {
+#if defined(GEODE_IS_WINDOWS)
+        dirStr += "\\";
+#else
+        dirStr += "/";
+#endif
+    }
+    return dirStr;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -84,7 +92,7 @@ private:
     std::mutex m_queueMutex;
     std::condition_variable m_cv;
     std::queue<std::vector<uint8_t>> m_frameQueue;
-    
+
     IMFSinkWriter* m_sinkWriter = nullptr;
     DWORD m_videoStreamIndex = 0;
     int m_width = 0, m_height = 0;
@@ -122,7 +130,7 @@ private:
                     std::memcpy(pData, flipped.data(), dataSize);
                     buffer->Unlock();
                     buffer->SetCurrentLength(dataSize);
-                    
+
                     if (SUCCEEDED(MFCreateSample(&sample))) {
                         sample->AddBuffer(buffer);
                         sample->SetSampleTime(m_videoTimeStamp);
@@ -255,11 +263,11 @@ private:
                     CVPixelBufferLockBaseAddress(pixelBuffer, 0);
                     void* data = CVPixelBufferGetBaseAddress(pixelBuffer);
                     int stride = m_width * 4;
-                    
+
                     for (int y = 0; y < m_height; ++y) {
                         std::memcpy((uint8_t*)data + y * stride, pixels.data() + (m_height - 1 - y) * stride, stride);
                     }
-                    
+
                     CMTime time = CMTimeMake(m_frameCount++, 30);
                     [m_adaptor appendPixelBuffer:pixelBuffer withPresentationTime:time];
                     CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
@@ -280,7 +288,7 @@ public:
         @autoreleasepool {
             NSString* nsPath = [NSString stringWithUTF8String:path.c_str()];
             NSURL* url = [NSURL fileURLWithPath:nsPath];
-            
+
             NSError* error = nil;
             m_assetWriter = [[AVAssetWriter alloc] initWithURL:url fileType:AVFileTypeMPEG4 error:&error];
             if (error || !m_assetWriter) return false;
@@ -302,12 +310,12 @@ public:
             };
 
             m_adaptor = [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:m_writerInput sourcePixelBufferAttributes:attributes];
-            
+
             [m_assetWriter addInput:m_writerInput];
             [m_assetWriter startWriting];
             [m_assetWriter startSessionAtSourceTime:kCMTimeZero];
         }
-        
+
         m_recording = true;
         m_workerThread = std::thread(&AppleRecorder::encodeLoop, this);
         return true;
@@ -497,7 +505,7 @@ public:
             return false;
         }
         AAudioStreamBuilder_delete(builder);
-        
+
         m_recording = true;
         AAudioStream_requestStart(m_stream);
         return true;
