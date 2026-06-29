@@ -4,44 +4,47 @@ project(MacroSafeguard)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_library(${PROJECT_NAME} SHARED src/main.cpp)
+if (APPLE)
+    add_library(${PROJECT_NAME} SHARED src/main.cpp)
+    set_source_files_properties(src/main.cpp PROPERTIES COMPILE_FLAGS "-x objective-c++")
+else()
+    add_library(${PROJECT_NAME} SHARED src/main.cpp)
+endif()
 
 if (NOT DEFINED ENV{GEODE_SDK})
     message(FATAL_ERROR "Unable to find Geode SDK! Please define GEODE_SDK.")
-else()
-    message(STATUS "Found Geode SDK at $ENV{GEODE_SDK}")
 endif()
 
 add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
 
 if (ANDROID)
-    # Try to locate AAudio. If present, link it and define HAVE_AAUDIO.
-    find_library(AAUDIO_LIB NAMES aaudio)
-
-    if(AAUDIO_LIB)
-        message(STATUS "Found AAudio: ${AAUDIO_LIB}; linking AAudio")
-        target_link_libraries(${PROJECT_NAME}
-            geode-sdk
-            mediandk       # AMediaCodec, AMediaMuxer — video encoding
-            ${AAUDIO_LIB}  # AAudio — microphone capture (only when present)
-            GLESv2         # glReadPixels — frame capture
-            android
-            log
-        )
-        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_AAUDIO=1)
-    else()
-        message(WARNING "AAudio not found; building without AAudio support")
-        target_link_libraries(${PROJECT_NAME}
-            geode-sdk
-            mediandk       # AMediaCodec, AMediaMuxer — video encoding
-            GLESv2         # glReadPixels — frame capture
-            android
-            log
-        )
-        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_AAUDIO=0)
-    endif()
-else()
-    target_link_libraries(${PROJECT_NAME} geode-sdk)
+    target_link_libraries(${PROJECT_NAME}
+        geode-sdk
+        mediandk       
+        GLESv2         
+        android
+        log
+    )
+elif (WIN32)
+    target_link_libraries(${PROJECT_NAME} 
+        geode-sdk
+        mfplat
+        mfuuid
+        mfreadwrite
+        ole32
+    )
+elif (APPLE)
+    find_library(AVFOUNDATION_RAW AVFoundation)
+    find_library(COREMEDIA_RAW CoreMedia)
+    find_library(COREVIDEO_RAW CoreVideo)
+    
+    target_link_libraries(${PROJECT_NAME} 
+        geode-sdk 
+        ${AVFOUNDATION_RAW} 
+        ${COREMEDIA_RAW} 
+        ${COREVIDEO_RAW}
+    )
 endif()
 
 setup_geode_mod(${PROJECT_NAME})
+
