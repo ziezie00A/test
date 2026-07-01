@@ -16,6 +16,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <cstring>
+#include <future>
 
 // ════════════════════════════════════════════════════════════════
 //  PLATFORM DEPENDENCIES & HEADERS
@@ -32,18 +33,13 @@
     #pragma comment(lib, "mfreadwrite.lib")
     #pragma comment(lib, "Ole32.lib")
 #elif defined(__APPLE__)
-    // 1. Clear any existing command-line macro definitions for CommentType
     #undef CommentType
-
-    // 2. Force Apple's headers to define their type under a harmless dummy name
     #define CommentType AppleCommentType
-
     #import <AVFoundation/AVFoundation.h>
     #import <CoreMedia/CoreMedia.h>
     #import <CoreVideo/CoreVideo.h>
-
-    // 3. Clear our redirection macro so it doesn't pollute your actual code downstream
     #undef CommentType
+    #define CommentType CommentTypeDummy
 #elif defined(GEODE_IS_ANDROID)
     #include <media/NdkMediaCodec.h>
     #include <media/NdkMediaMuxer.h>
@@ -67,10 +63,13 @@ using namespace geode::prelude;
 static std::string getRecordingsDir() {
     auto saveDir = geode::Mod::get()->getSaveDir();
     auto recordingsDir = saveDir / "Recordings";
-    
+
     std::error_code ec;
     std::filesystem::create_directories(recordingsDir, ec);
-    
+    if (ec) {
+        geode::log::error("Recorder: failed to create recordings dir: {}", ec.message());
+    }
+
     std::string dirStr = recordingsDir.string();
     if (!dirStr.empty() && dirStr.back() != '/' && dirStr.back() != '\\') {
 #if defined(GEODE_IS_WINDOWS)
@@ -101,9 +100,79 @@ private:
     UINT64 m_videoTimeStamp = 0;
     std::string m_path;
 
-    void encodeLoop() {
-        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    // NOTE: This used to be called from the *calling* thread while
+    // WriteSample()/Finalize() were called from the worker thread.
+    // IMFSinkWriter objects created under COINIT_APARTMENTTHREADED are
+    // apartment-affine; calling them from a different thread/apartment
+    // than the one that created them silently fails every call (HRESULTs
+    // were never checked), which is why the resulting .mp4 came out as
+    // an empty/near-empty container. Fix: create + use the sink writer
+    // entirely on the worker thread, under COINIT_MULTITHREADED, and
+    // check every HRESULT.
+    bool initSinkWriter() {
+        std::wstring wpath = std::filesystem::path(m_path).wstring();
+        HRESULT hr = MFCreateSinkWriterFromURL(wpath.c_str(), NULL, NULL, &m_sinkWriter);
+        if (FAILED(hr)) {
+            geode::log::error("Recorder: MFCreateSinkWriterFromURL failed (0x{:08x})", static_cast<unsigned>(hr));
+            return false;
+        }
+
+        IMFMediaType* outType = nullptr;
+        MFCreateMediaType(&outType);
+        outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        outType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+        outType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        MFSetAttributeSize(outType, MF_MT_FRAME_SIZE, m_width, m_height);
+        MFSetAttributeRatio(outType, MF_MT_FRAME_RATE, 30, 1);
+        outType->SetUINT32(MF_MT_AVG_BITRATE, 4000000);
+        hr = m_sinkWriter->AddStream(outType, &m_videoStreamIndex);
+        outType->Release();
+        if (FAILED(hr)) {
+            geode::log::error("Recorder: AddStream failed (0x{:08x})", static_cast<unsigned>(hr));
+            m_sinkWriter->Release();
+            m_sinkWriter = nullptr;
+            return false;
+        }
+
+        IMFMediaType* inType = nullptr;
+        MFCreateMediaType(&inType);
+        inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        inType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        inType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        MFSetAttributeSize(inType, MF_MT_FRAME_SIZE, m_width, m_height);
+        hr = m_sinkWriter->SetInputMediaType(m_videoStreamIndex, inType, NULL);
+        inType->Release();
+        if (FAILED(hr)) {
+            geode::log::error("Recorder: SetInputMediaType failed (0x{:08x})", static_cast<unsigned>(hr));
+            m_sinkWriter->Release();
+            m_sinkWriter = nullptr;
+            return false;
+        }
+
+        hr = m_sinkWriter->BeginWriting();
+        if (FAILED(hr)) {
+            geode::log::error("Recorder: BeginWriting failed (0x{:08x})", static_cast<unsigned>(hr));
+            m_sinkWriter->Release();
+            m_sinkWriter = nullptr;
+            return false;
+        }
+
+        return true;
+    }
+
+    void encodeLoop(std::promise<bool> readyPromise) {
+        HRESULT coHr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        bool comInited = SUCCEEDED(coHr) || coHr == S_FALSE;
         MFStartup(MF_VERSION);
+
+        bool ok = initSinkWriter();
+        readyPromise.set_value(ok);
+
+        if (!ok) {
+            MFShutdown();
+            if (comInited) CoUninitialize();
+            return;
+        }
 
         while (m_recording || !m_frameQueue.empty()) {
             std::vector<uint8_t> pixels;
@@ -126,32 +195,45 @@ private:
             IMFMediaBuffer* buffer = nullptr;
             BYTE* pData = nullptr;
 
-            if (SUCCEEDED(MFCreateMemoryBuffer(dataSize, &buffer))) {
-                if (SUCCEEDED(buffer->Lock(&pData, NULL, NULL))) {
+            HRESULT hr = MFCreateMemoryBuffer(dataSize, &buffer);
+            if (SUCCEEDED(hr)) {
+                hr = buffer->Lock(&pData, NULL, NULL);
+                if (SUCCEEDED(hr)) {
                     std::memcpy(pData, flipped.data(), dataSize);
                     buffer->Unlock();
                     buffer->SetCurrentLength(dataSize);
 
-                    if (SUCCEEDED(MFCreateSample(&sample))) {
+                    hr = MFCreateSample(&sample);
+                    if (SUCCEEDED(hr)) {
                         sample->AddBuffer(buffer);
                         sample->SetSampleTime(m_videoTimeStamp);
                         sample->SetSampleDuration(m_frameDuration);
-                        m_sinkWriter->WriteSample(m_videoStreamIndex, sample);
+                        hr = m_sinkWriter->WriteSample(m_videoStreamIndex, sample);
+                        if (FAILED(hr)) {
+                            geode::log::error("Recorder: WriteSample failed (0x{:08x})", static_cast<unsigned>(hr));
+                        }
                         sample->Release();
                     }
+                } else {
+                    geode::log::error("Recorder: buffer->Lock failed (0x{:08x})", static_cast<unsigned>(hr));
                 }
                 buffer->Release();
+            } else {
+                geode::log::error("Recorder: MFCreateMemoryBuffer failed (0x{:08x})", static_cast<unsigned>(hr));
             }
             m_videoTimeStamp += m_frameDuration;
         }
 
         if (m_sinkWriter) {
-            m_sinkWriter->Finalize();
+            HRESULT hr = m_sinkWriter->Finalize();
+            if (FAILED(hr)) {
+                geode::log::error("Recorder: Finalize failed (0x{:08x})", static_cast<unsigned>(hr));
+            }
             m_sinkWriter->Release();
             m_sinkWriter = nullptr;
         }
         MFShutdown();
-        CoUninitialize();
+        if (comInited) CoUninitialize();
     }
 
 public:
@@ -159,38 +241,22 @@ public:
         if (m_recording) return false;
         m_width = width; m_height = height; m_videoTimeStamp = 0; m_path = path;
 
-        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-        MFStartup(MF_VERSION);
-
-        std::wstring wpath = std::filesystem::path(path).wstring();
-        HRESULT hr = MFCreateSinkWriterFromURL(wpath.c_str(), NULL, NULL, &m_sinkWriter);
-        if (FAILED(hr)) return false;
-
-        IMFMediaType* outType = nullptr;
-        MFCreateMediaType(&outType);
-        outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        outType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-        MFSetAttributeSize(outType, MF_MT_FRAME_SIZE, width, height);
-        MFSetAttributeRatio(outType, MF_MT_FRAME_RATE, 30, 1);
-        outType->SetUINT32(MF_MT_AVG_BITRATE, 4000000);
-        m_sinkWriter->AddStream(outType, &m_videoStreamIndex);
-        outType->Release();
-
-        IMFMediaType* inType = nullptr;
-        MFCreateMediaType(&inType);
-        inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        inType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-        MFSetAttributeSize(inType, MF_MT_FRAME_SIZE, width, height);
-        m_sinkWriter->SetInputMediaType(m_videoStreamIndex, inType, NULL);
-        inType->Release();
-
-        if (FAILED(m_sinkWriter->BeginWriting())) {
-            m_sinkWriter->Release(); m_sinkWriter = nullptr;
-            return false;
-        }
+        std::promise<bool> readyPromise;
+        std::future<bool> readyFuture = readyPromise.get_future();
 
         m_recording = true;
-        m_workerThread = std::thread(&WindowsRecorder::encodeLoop, this);
+        m_workerThread = std::thread(&WindowsRecorder::encodeLoop, this, std::move(readyPromise));
+
+        // Block until the sink writer is actually created & BeginWriting()
+        // has succeeded on the owning (worker) thread, so callers get a
+        // real success/failure result instead of an optimistic true.
+        bool ok = readyFuture.get();
+        if (!ok) {
+            m_recording = false;
+            m_cv.notify_all();
+            if (m_workerThread.joinable()) m_workerThread.join();
+            return false;
+        }
         return true;
     }
 
@@ -254,13 +320,16 @@ private:
                     m_frameQueue.pop();
                 }
 
-                if (!m_writerInput.readyForMoreMediaData) continue;
+                if (!m_writerInput.readyForMoreMediaData) {
+                    geode::log::warn("Recorder: writer input not ready, dropping frame");
+                    continue;
+                }
 
                 CVPixelBufferRef pixelBuffer = NULL;
                 CVPixelBufferPoolRef pool = m_adaptor.pixelBufferPool;
-                CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pixelBuffer);
+                CVReturn cvr = CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pixelBuffer);
 
-                if (pixelBuffer) {
+                if (cvr == kCVReturnSuccess && pixelBuffer) {
                     CVPixelBufferLockBaseAddress(pixelBuffer, 0);
                     void* data = CVPixelBufferGetBaseAddress(pixelBuffer);
                     int stride = m_width * 4;
@@ -270,14 +339,35 @@ private:
                     }
 
                     CMTime time = CMTimeMake(m_frameCount++, 30);
-                    [m_adaptor appendPixelBuffer:pixelBuffer withPresentationTime:time];
+                    BOOL appended = [m_adaptor appendPixelBuffer:pixelBuffer withPresentationTime:time];
+                    if (!appended) {
+                        geode::log::error("Recorder: appendPixelBuffer failed: {}",
+                            m_assetWriter.error ? m_assetWriter.error.localizedDescription.UTF8String : "unknown error");
+                    }
                     CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
                     CVPixelBufferRelease(pixelBuffer);
+                } else {
+                    geode::log::error("Recorder: CVPixelBufferPoolCreatePixelBuffer failed ({})", (int)cvr);
                 }
             }
 
+            // NOTE: finishWritingWithCompletionHandler is asynchronous.
+            // The previous empty completion handler meant nothing ever
+            // waited for it, so stop()/the worker thread could return
+            // before the file was actually flushed to disk - a race that
+            // can easily produce a truncated or empty .mp4. Block on a
+            // semaphore until finalize genuinely completes.
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
             [m_writerInput markAsFinished];
-            [m_assetWriter finishWritingWithCompletionHandler:^{}];
+            [m_assetWriter finishWritingWithCompletionHandler:^{
+                dispatch_semaphore_signal(sem);
+            }];
+            dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+
+            if (m_assetWriter.status == AVAssetWriterStatusFailed) {
+                geode::log::error("Recorder: asset writer failed: {}",
+                    m_assetWriter.error ? m_assetWriter.error.localizedDescription.UTF8String : "unknown error");
+            }
         }
     }
 
@@ -292,7 +382,11 @@ public:
 
             NSError* error = nil;
             m_assetWriter = [[AVAssetWriter alloc] initWithURL:url fileType:AVFileTypeMPEG4 error:&error];
-            if (error || !m_assetWriter) return false;
+            if (error || !m_assetWriter) {
+                geode::log::error("Recorder: AVAssetWriter init failed: {}",
+                    error ? error.localizedDescription.UTF8String : "unknown error");
+                return false;
+            }
 
             NSDictionary* outputSettings = @{
                 AVVideoCodecKey: AVVideoCodecTypeH264,
@@ -311,8 +405,17 @@ public:
 
             m_adaptor = [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:m_writerInput sourcePixelBufferAttributes:attributes];
 
+            if (![m_assetWriter canAddInput:m_writerInput]) {
+                geode::log::error("Recorder: cannot add writer input");
+                return false;
+            }
             [m_assetWriter addInput:m_writerInput];
-            [m_assetWriter startWriting];
+
+            if (![m_assetWriter startWriting]) {
+                geode::log::error("Recorder: startWriting failed: {}",
+                    m_assetWriter.error ? m_assetWriter.error.localizedDescription.UTF8String : "unknown error");
+                return false;
+            }
             [m_assetWriter startSessionAtSourceTime:kCMTimeZero];
         }
 
@@ -351,7 +454,7 @@ static AppleRecorder g_appleRecorder;
 #endif
 
 // ════════════════════════════════════════════════════════════════
-//  ANDROID BACKEND: Multi-Threaded Engine with Full AAudio Mic Input
+//  ANDROID BACKEND: Multi-Threaded Engine
 // ════════════════════════════════════════════════════════════════
 #if defined(GEODE_IS_ANDROID)
 static void rgbaToNV12(const uint8_t* rgba, int width, int height, int stride, int sliceHeight, uint8_t* dst) {
@@ -389,39 +492,138 @@ private:
     AMediaMuxer* m_muxer = nullptr;
     int m_fd = -1;
     int m_width = 0, m_height = 0;
+    int m_inputStride = 0, m_inputSliceHeight = 0; // actual layout the codec wants
+    int64_t m_frameCount = 0;
     std::string m_path;
 
     void encodeLoop() {
+        bool muxerStarted = false;
+        ssize_t trackIdx = -1;
+        AMediaCodecBufferInfo info;
+
         while (m_recording || !m_frameQueue.empty()) {
+            // 1. INPUT PROCESSING
             std::vector<uint8_t> rgba;
             {
                 std::unique_lock<std::mutex> lock(m_queueMutex);
-                m_cv.wait(lock, [this] { return !m_frameQueue.empty() || !m_recording; });
-                if (m_frameQueue.empty() && !m_recording) break;
-                rgba = std::move(m_frameQueue.front());
-                m_frameQueue.pop();
-            }
-
-            ssize_t idx = AMediaCodec_dequeueInputBuffer(m_codec, 10000);
-            if (idx >= 0) {
-                size_t cap = 0;
-                uint8_t* buf = AMediaCodec_getInputBuffer(m_codec, idx, &cap);
-                if (buf) {
-                    std::memset(buf, 0, cap);
-                    rgbaToNV12(rgba.data(), m_width, m_height, m_width, m_height, buf);
-                    int64_t ts = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    AMediaCodec_queueInputBuffer(m_codec, idx, 0, cap, ts, 0);
+                m_cv.wait_for(lock, std::chrono::milliseconds(5), [this] {
+                    return !m_frameQueue.empty() || !m_recording;
+                });
+                if (!m_frameQueue.empty()) {
+                    rgba = std::move(m_frameQueue.front());
+                    m_frameQueue.pop();
                 }
             }
+
+            if (!rgba.empty()) {
+                ssize_t inIdx = AMediaCodec_dequeueInputBuffer(m_codec, 2000);
+                if (inIdx >= 0) {
+                    size_t cap = 0;
+                    uint8_t* buf = AMediaCodec_getInputBuffer(m_codec, inIdx, &cap);
+                    // Required size uses the codec's own stride/slice-height, not
+                    // a tightly-packed assumption - many real hardware encoders
+                    // pad these beyond width/height, and writing/queuing a
+                    // tightly-packed buffer against that layout causes every
+                    // frame to be silently rejected (no output ever produced,
+                    // muxer track never starts, file ends up empty).
+                    size_t frameSize = static_cast<size_t>(m_inputStride) * m_inputSliceHeight * 3 / 2;
+                    if (buf && cap >= frameSize) {
+                        rgbaToNV12(rgba.data(), m_width, m_height, m_inputStride, m_inputSliceHeight, buf);
+                        int64_t ts = m_frameCount++ * 33333;
+                        media_status_t st = AMediaCodec_queueInputBuffer(m_codec, inIdx, 0, frameSize, ts, 0);
+                        if (st != AMEDIA_OK) {
+                            geode::log::error("Recorder: queueInputBuffer failed ({})", (int)st);
+                        }
+                    } else {
+                        geode::log::error("Recorder: input buffer too small (cap={}, need={}) - discarding frame, encoder layout mismatch", cap, frameSize);
+                        AMediaCodec_queueInputBuffer(m_codec, inIdx, 0, 0, 0, 0);
+                    }
+                }
+            }
+
+            // 2. OUTPUT PROCESSING
+            while (true) {
+                ssize_t outIdx = AMediaCodec_dequeueOutputBuffer(m_codec, &info, 2000);
+                if (outIdx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+                    AMediaFormat* format = AMediaCodec_getOutputFormat(m_codec);
+                    trackIdx = AMediaMuxer_addTrack(m_muxer, format);
+                    if (trackIdx < 0) {
+                        geode::log::error("Recorder: AMediaMuxer_addTrack failed ({})", (int)trackIdx);
+                    } else {
+                        media_status_t st = AMediaMuxer_start(m_muxer);
+                        if (st != AMEDIA_OK) {
+                            geode::log::error("Recorder: AMediaMuxer_start failed ({})", (int)st);
+                        } else {
+                            muxerStarted = true;
+                        }
+                    }
+                    AMediaFormat_delete(format);
+                } else if (outIdx >= 0) {
+                    size_t cap = 0;
+                    uint8_t* buf = AMediaCodec_getOutputBuffer(m_codec, outIdx, &cap);
+                    if (buf && muxerStarted && info.size > 0 && (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) == 0) {
+                        AMediaMuxer_writeSampleData(m_muxer, trackIdx, buf, &info);
+                    }
+                    AMediaCodec_releaseOutputBuffer(m_codec, outIdx, false);
+                    if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // 3. DRAIN LOGIC: Lock loop until encoder processes the EOS flag
+        while (true) {
+            ssize_t inIdx = AMediaCodec_dequeueInputBuffer(m_codec, 10000);
+            if (inIdx >= 0) {
+                AMediaCodec_queueInputBuffer(m_codec, inIdx, 0, 0, 0, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+                break;
+            }
+        }
+
+        bool sawEOS = false;
+        while (!sawEOS) {
+            ssize_t outIdx = AMediaCodec_dequeueOutputBuffer(m_codec, &info, 50000);
+            if (outIdx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+                AMediaFormat* format = AMediaCodec_getOutputFormat(m_codec);
+                trackIdx = AMediaMuxer_addTrack(m_muxer, format);
+                if (trackIdx >= 0 && AMediaMuxer_start(m_muxer) == AMEDIA_OK) {
+                    muxerStarted = true;
+                }
+                AMediaFormat_delete(format);
+            } else if (outIdx >= 0) {
+                if (muxerStarted && info.size > 0 && (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) == 0) {
+                    size_t cap = 0;
+                    uint8_t* buf = AMediaCodec_getOutputBuffer(m_codec, outIdx, &cap);
+                    AMediaMuxer_writeSampleData(m_muxer, trackIdx, buf, &info);
+                }
+                AMediaCodec_releaseOutputBuffer(m_codec, outIdx, false);
+                if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) {
+                    sawEOS = true;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if (!muxerStarted) {
+            geode::log::error("Recorder: muxer never started, output file will be empty");
+        } else {
+            AMediaMuxer_stop(m_muxer);
         }
     }
 
 public:
     bool start(const std::string& path, int width, int height) {
         if (m_recording) return false;
-        m_width = width; m_height = height; m_path = path;
+        m_width = width; m_height = height; m_path = path; m_frameCount = 0;
         m_codec = AMediaCodec_createEncoderByType("video/avc");
-        if (!m_codec) return false;
+        if (!m_codec) {
+            geode::log::error("Recorder: createEncoderByType failed");
+            return false;
+        }
 
         AMediaFormat* fmt = AMediaFormat_new();
         AMediaFormat_setString(fmt, AMEDIAFORMAT_KEY_MIME, "video/avc");
@@ -430,14 +632,58 @@ public:
         AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_FRAME_RATE, 30);
         AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_BIT_RATE, 4000000);
         AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_I_FRAME_INTERVAL, 1);
-        AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_COLOR_FORMAT, 0x15);
+        AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_COLOR_FORMAT, 0x15); // NV12
 
-        AMediaCodec_configure(m_codec, fmt, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
+        media_status_t status = AMediaCodec_configure(m_codec, fmt, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
         AMediaFormat_delete(fmt);
+        if (status != AMEDIA_OK) {
+            geode::log::error("Recorder: AMediaCodec_configure failed ({})", (int)status);
+            AMediaCodec_delete(m_codec); m_codec = nullptr;
+            return false;
+        }
 
         m_fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (m_fd < 0) {
+            geode::log::error("Recorder: failed to open output file (errno {})", errno);
+            AMediaCodec_delete(m_codec); m_codec = nullptr;
+            return false;
+        }
+
         m_muxer = AMediaMuxer_new(m_fd, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
-        AMediaCodec_start(m_codec);
+        if (!m_muxer) {
+            geode::log::error("Recorder: AMediaMuxer_new failed");
+            ::close(m_fd); m_fd = -1;
+            AMediaCodec_delete(m_codec); m_codec = nullptr;
+            return false;
+        }
+
+        status = AMediaCodec_start(m_codec);
+        if (status != AMEDIA_OK) {
+            geode::log::error("Recorder: AMediaCodec_start failed ({})", (int)status);
+            AMediaMuxer_delete(m_muxer); m_muxer = nullptr;
+            ::close(m_fd); m_fd = -1;
+            AMediaCodec_delete(m_codec); m_codec = nullptr;
+            return false;
+        }
+
+        // Default to tightly-packed, then override with whatever the codec
+        // actually reports for its input buffer layout - hardware encoders
+        // very often pad stride/slice-height beyond width/height.
+        m_inputStride = width;
+        m_inputSliceHeight = height;
+        AMediaFormat* inFmt = AMediaCodec_getInputFormat(m_codec);
+        if (inFmt) {
+            int32_t stride = 0, sliceHeight = 0;
+            if (AMediaFormat_getInt32(inFmt, AMEDIAFORMAT_KEY_STRIDE, &stride) && stride > 0) {
+                m_inputStride = stride;
+            }
+            if (AMediaFormat_getInt32(inFmt, "slice-height", &sliceHeight) && sliceHeight > 0) {
+                m_inputSliceHeight = sliceHeight;
+            }
+            geode::log::debug("Recorder: encoder input layout stride={} sliceHeight={} (frame {}x{})",
+                m_inputStride, m_inputSliceHeight, width, height);
+            AMediaFormat_delete(inFmt);
+        }
 
         m_recording = true;
         m_workerThread = std::thread(&AndroidVideoRecorder::encodeLoop, this);
@@ -500,11 +746,12 @@ public:
         AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
         AAudioStreamBuilder_setDataCallback(builder, dataCallback, this);
 
-        if (AAudioStreamBuilder_openStream(builder, &m_stream) != AAUDIO_OK) {
-            AAudioStreamBuilder_delete(builder);
+        aaudio_result_t res = AAudioStreamBuilder_openStream(builder, &m_stream);
+        AAudioStreamBuilder_delete(builder);
+        if (res != AAUDIO_OK) {
+            geode::log::error("Recorder: AAudio openStream failed ({})", (int)res);
             return false;
         }
-        AAudioStreamBuilder_delete(builder);
 
         m_recording = true;
         AAudioStream_requestStart(m_stream);
@@ -545,7 +792,10 @@ static void saveClicksCSV(const std::vector<ActionEvent>& actions, bool saveFile
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     std::string path = getRecordingsDir() + std::to_string(ms) + "_clicks.csv";
     std::ofstream f(path);
-    if (!f) return;
+    if (!f) {
+        geode::log::error("Recorder: failed to open clicks CSV at {}", path);
+        return;
+    }
     f << "frame,button,press,player2\n";
     for (const auto& e : actions)
         f << e.frame << ',' << e.button << ',' << (e.isPress ? 1 : 0) << ',' << (e.isPlayer2 ? 1 : 0) << '\n';
@@ -604,17 +854,23 @@ class $modify(MyPlayLayer, PlayLayer) {
 
         auto* view = CCDirector::sharedDirector()->getOpenGLView();
         auto size = view->getFrameSize();
-        int width = static_cast<int>(size.width) & ~3;
-        int height = static_cast<int>(size.height) & ~3;
 
+        // 16-macroblock boundary alignment (required by most H.264 encoders)
+        int width = static_cast<int>(size.width) & ~15;
+        int height = static_cast<int>(size.height) & ~15;
+
+        bool started = false;
 #if defined(GEODE_IS_WINDOWS)
-        g_winRecorder.start(m_fields->m_currentRecordingPath, width, height);
+        started = g_winRecorder.start(m_fields->m_currentRecordingPath, width, height);
 #elif defined(__APPLE__)
-        g_appleRecorder.start(m_fields->m_currentRecordingPath, width, height);
+        started = g_appleRecorder.start(m_fields->m_currentRecordingPath, width, height);
 #elif defined(GEODE_IS_ANDROID)
-        g_androidRecorder.start(m_fields->m_currentRecordingPath, width, height);
+        started = g_androidRecorder.start(m_fields->m_currentRecordingPath, width, height);
         g_micRecorder.start(m_fields->m_audioRecordingPath);
 #endif
+        if (!started) {
+            geode::log::error("Recorder: failed to start recording at {}", m_fields->m_currentRecordingPath);
+        }
     }
 
     void checkAndSaveIfQualified() {
